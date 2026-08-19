@@ -1,0 +1,28 @@
+# ==== Rust / Cargo ====
+# 构建产物（debug / release 编译输出）
+/target/
+**/*.rs.bk
+
+# 本地 cargo registry 缓存（一般用户目录下，保险起见加上）
+.cargo/registry/
+.cargo/git/
+
+# 若不需要把锁定版本提交到 git，可取消注释下面一行（二进制项目通常推荐保留 Cargo.lock）
+# Cargo.lock
+
+# ==== 编辑器 / IDE ====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==== 操作系统 ====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==== 临时日志 / 调试文件 ====
+*.log
+tmp/
+temp/
