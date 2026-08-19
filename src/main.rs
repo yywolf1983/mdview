@@ -994,7 +994,7 @@ fn render_page(title: &str, breadcrumb: &str, body: &str) -> String {
       var(--bg);
     min-height: 100vh;
     line-height: 1.7;
-    font-size: 15px;
+    font-size: 22px;
     -webkit-font-smoothing: antialiased;
   }}
   .shell {{ max-width: 1060px; margin: 0 auto; padding: 28px 24px 64px; }}
