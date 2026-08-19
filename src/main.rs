@@ -17,11 +17,11 @@ use tokio::net::TcpListener;
 #[derive(Parser, Debug)]
 #[command(name = "mdview", about = "Markdown 文件浏览器")]
 struct Args {
-    /// 要浏览的目录（绝对路径）
-    #[arg(short, long, default_value = "./docs")]
+    /// 要浏览的 Markdown 目录（必填，无默认）
+    #[arg(short, long, required = true)]
     dir: String,
 
-    /// 监听地址
+    /// 监听地址（默认 127.0.0.1:9880）
     #[arg(long, default_value = "127.0.0.1:9880")]
     addr: String,
 }
