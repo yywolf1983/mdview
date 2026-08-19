@@ -769,6 +769,42 @@ fn rewrite_relative_urls(html: &str, rel_dir: &str) -> String {
 /// 为 <h1>..<h6> 自动注入 id="slug"（GitHub 风格 slug），
 /// 让文件内的 [锚点](#xxx) 链接可正常跳转。
 fn inject_heading_ids(html: &str) -> String {
+    // 把字符串变成「归一化锚点」：去掉所有非 CJK/ASCII 字母数字的字符
+    // 用于用户写的 #六治疗体系 和 实际 id="六-治疗体系" 这种标点差异的模糊匹配
+    fn normalize_for_match(input: &str) -> String {
+        let mut stripped = String::with_capacity(input.len());
+        let mut in_tag = false;
+        for c in input.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => stripped.push(c),
+                _ => {}
+            }
+        }
+        let mut out = String::with_capacity(stripped.len());
+        for ch in stripped.chars() {
+            let keep = if ch.is_ascii_alphanumeric() {
+                true
+            } else {
+                let cp = ch as u32;
+                (0x3400..=0x4DBF).contains(&cp)
+                    || (0x4E00..=0x9FFF).contains(&cp)
+                    || (0x20000..=0x2A6DF).contains(&cp)
+                    || (0x3040..=0x30FF).contains(&cp)
+                    || (0xAC00..=0xD7AF).contains(&cp)
+                    || (0x3005..=0x3006).contains(&cp)
+            };
+            if keep {
+                if ch.is_ascii_uppercase() {
+                    out.push(ch.to_ascii_lowercase());
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        out
+    }
     fn slugify(input: &str) -> String {
         // 1. 去 HTML 标签
         let mut stripped = String::with_capacity(input.len());
@@ -857,6 +893,19 @@ fn inject_heading_ids(html: &str) -> String {
                     } else {
                         let last = new_open_tag.len() - 1;
                         new_open_tag = format!("{} id=\"{}\">", &new_open_tag[..last], slug);
+                    }
+                }
+                // 附加 data-anchor-stripped：归一化（去全部标点/空格/- 后）的模糊匹配 key
+                // 比如 "六、治疗体系" → data-anchor-stripped="六治疗体系"，兼容 [xxx](#六治疗体系)
+                let stripped_key = normalize_for_match(&content_text);
+                if !stripped_key.is_empty() {
+                    let escaped = stripped_key.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+                    if new_open_tag.ends_with("/>") {
+                        let end = new_open_tag.len() - 2;
+                        new_open_tag = format!("{} data-anchor-stripped=\"{}\" />", &new_open_tag[..end], escaped);
+                    } else if new_open_tag.ends_with('>') {
+                        let last = new_open_tag.len() - 1;
+                        new_open_tag = format!("{} data-anchor-stripped=\"{}\">", &new_open_tag[..last], escaped);
                     }
                 }
                 out.extend(new_open_tag.chars());
@@ -1466,9 +1515,162 @@ fn render_page(title: &str, breadcrumb: &str, body: &str) -> String {
     ul.file-list li .list-actions {{ justify-content: flex-end; }}
     .new-form form {{ flex-direction: column; align-items: stretch; }}
     .new-form button.primary {{ align-self: flex-start; }}
+    #back-top {{ right: 16px; bottom: 16px; width: 44px; height: 44px; }}
+  }}
+
+  /* ---- Floating Back to Top ---- */
+  #back-top {{
+    position: fixed;
+    right: 28px;
+    bottom: 32px;
+    width: 52px;
+    height: 52px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,.7);
+    background: linear-gradient(135deg, rgba(109,40,217,.92), rgba(219,39,119,.88));
+    color: #fff;
+    font-size: 22px;
+    line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    box-shadow: 0 14px 32px rgba(109,40,217,.32), 0 2px 6px rgba(15,23,42,.08), inset 0 0 0 1px rgba(255,255,255,.35);
+    backdrop-filter: saturate(160%) blur(10px);
+    -webkit-backdrop-filter: saturate(160%) blur(10px);
+    z-index: 9999;
+    cursor: pointer;
+    opacity: 0;
+    transform: translateY(16px) scale(.82);
+    pointer-events: none;
+    transition: opacity .22s ease, transform .24s cubic-bezier(.2,.9,.3,1.2), box-shadow .18s;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #back-top:hover {{ box-shadow: 0 18px 40px rgba(219,39,119,.34), 0 2px 8px rgba(15,23,42,.12), inset 0 0 0 1px rgba(255,255,255,.5); }}
+  #back-top:active {{ transform: translateY(10px) scale(.96); }}
+  #back-top.show {{
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }}
+  @media (prefers-reduced-motion: reduce) {{
+    #back-top {{ transition: opacity .15s linear; }}
   }}
 </style>
 <script>
+/* ---------- Floating Back to Top ---------- */
+(function(){{
+  const THRESHOLD = 360;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'back-top';
+  btn.title = '回到顶部';
+  btn.setAttribute('aria-label', '回到顶部');
+  btn.innerHTML = '⤴';
+  btn.addEventListener('click', function() {{
+    try {{ window.scrollTo({{top:0, behavior:'smooth'}}); }}
+    catch(_) {{ window.scrollTo(0,0); }}
+  }});
+  document.addEventListener('DOMContentLoaded', function() {{
+    document.body.appendChild(btn);
+    var ticking = false;
+    function update() {{
+      var y = window.scrollY || document.documentElement.scrollTop || 0;
+      if (y >= THRESHOLD) btn.classList.add('show');
+      else btn.classList.remove('show');
+      ticking = false;
+    }}
+    update();
+    window.addEventListener('scroll', function() {{
+      if (!ticking) {{
+        window.requestAnimationFrame ? requestAnimationFrame(update) : setTimeout(update, 16);
+        ticking = true;
+      }}
+    }}, {{ passive: true }});
+    window.addEventListener('resize', function() {{
+      if (!ticking) {{ requestAnimationFrame ? requestAnimationFrame(update) : setTimeout(update, 16); ticking = true; }}
+    }}, {{ passive: true }});
+  }});
+  // DOMContentLoaded 可能已经过去（脚本放在 body 前）也兜底一次
+  if (document.readyState === 'interactive' || document.readyState === 'complete') {{
+    if (!document.getElementById('back-top')) document.body.appendChild(btn);
+  }}
+}})();
+
+/* ---------- Anchor / Heading 模糊匹配（中文标点差异） ---------- */
+(function(){{
+  function normHash(s) {{
+    // 与后端 normalize_for_match 保持一致：去掉一切非 CJK/ASCII 字母数字的字符
+    // 注意：fragment 可能包含 %XX，先 decode。
+    let t = '';
+    try {{ t = decodeURIComponent(s); }} catch(_) {{ t = s; }}
+    if (t.startsWith('#')) t = t.slice(1);
+    return t.replace(/[^0-9A-Za-z\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u3005-\u3006]/g, '').toLowerCase();
+  }}
+  function tryScrollToHash(raw) {{
+    if (!raw) return false;
+    let frag = raw;
+    try {{ frag = decodeURIComponent(raw); }} catch(_) {{ frag = raw; }}
+    if (frag.startsWith('#')) frag = frag.slice(1);
+    // 1. 原生精确匹配（id）
+    const byId = document.getElementById(frag);
+    if (byId) {{ byId.scrollIntoView({{behavior:'smooth',block:'start'}}); return true; }}
+    // 1b. 按 name 属性（老写法）
+    try {{
+      const esc = frag ? CSS.escape(frag) : '';
+      if (esc) {{
+        const sel = 'a[name=' + esc + ']';
+        const byName = document.querySelector(sel);
+        if (byName) {{ byName.scrollIntoView({{behavior:'smooth',block:'start'}}); return true; }}
+      }}
+    }} catch(_) {{}}
+    // 2. 模糊匹配：按 data-anchor-stripped（归一化 key）
+    const need = normHash(raw);
+    if (!need) return false;
+    const headings = document.querySelectorAll('h1,h2,h3,h4,h5,h6');
+    for (let i=0;i<headings.length;i++) {{
+      const h = headings[i];
+      const s = h.getAttribute('data-anchor-stripped') || '';
+      if (s && s === need) {{
+        h.scrollIntoView({{behavior:'smooth',block:'start'}});
+        history.replaceState(null, '', '#' + encodeURIComponent(frag));
+        return true;
+      }}
+    }}
+    // 2b. slug 里把 '-' 都去掉后与 need 比较（id='六-治疗体系' vs need='六治疗体系'）
+    for (let i=0;i<headings.length;i++) {{
+      const h = headings[i];
+      const id = (h.getAttribute('id') || '').replace(/-/g,'').toLowerCase();
+      if (id === need) {{
+        h.scrollIntoView({{behavior:'smooth',block:'start'}});
+        history.replaceState(null, '', '#' + encodeURIComponent(frag));
+        return true;
+      }}
+      const s = (h.getAttribute('data-anchor-stripped') || '').replace(/-/g,'').toLowerCase();
+      if (s === need) {{
+        h.scrollIntoView({{behavior:'smooth',block:'start'}});
+        history.replaceState(null, '', '#' + encodeURIComponent(frag));
+        return true;
+      }}
+    }}
+    return false;
+  }}
+  // 拦截所有站内锚点链接（href 以 # 开头）点击
+  document.addEventListener('click', function(e) {{
+    const a = e.target && e.target.closest ? e.target.closest('a') : null;
+    if (!a) return;
+    const href = a.getAttribute('href') || '';
+    if (href.length < 2 || href.charAt(0) != '#') return;
+    // 原生先让浏览器走一次，如果失败（tryScroll 里仍找不到）再兜底
+    setTimeout(function() {{ tryScrollToHash(href); }}, 0);
+  }});
+  // hashchange 时兜底（浏览器 forward/back 或直接改 URL）
+  window.addEventListener('hashchange', function() {{
+    tryScrollToHash(location.hash);
+  }});
+  // 页面初次加载如果 URL 带 fragment 尝试一下
+  if (location.hash) window.addEventListener('load', function() {{
+    setTimeout(function() {{ tryScrollToHash(location.hash); }}, 50);
+  }});
+}})();
+
 function toggleEditor() {{
   const form = document.getElementById('editor-form');
   if (!form) return;
@@ -1523,7 +1725,7 @@ function toggleEditor() {{
     }}
     closeModal();
   }}
-  // Public API：delete-btn 通过 onclick="confirmDelete(this,'hello.md','file')" 调用
+  // Public API (delete-btn 通过 onclick 调用：confirmDelete(this, label, kind))
   window.confirmDelete = function(btn, label, kind) {{
     const form = btn.closest('form');
     if (!form) return;
