@@ -324,3 +324,92 @@ document.addEventListener('keydown', function(e) {
     });
   });
 })();
+/* ---------- Rename Confirm Modal ---------- */
+(function(){
+  let pendingAction = '';
+  function openRenameModal(action, currentName) {
+    const mask = document.getElementById('rename-modal');
+    if (!mask) return;
+    pendingAction = action;
+    const input = mask.querySelector('#rename-input');
+    if (input) {
+      input.value = currentName || '';
+      input.focus();
+      const dot = currentName.lastIndexOf('.');
+      // 文件选中文件名部分（保留扩展名），目录全选
+      if (dot > 0) {
+        input.setSelectionRange(0, dot);
+      } else {
+        input.select();
+      }
+    }
+    const errEl = mask.querySelector('[data-rename-err]');
+    if (errEl) errEl.classList.add('hidden');
+    mask.classList.remove('hidden');
+  }
+  function closeRenameModal() {
+    const mask = document.getElementById('rename-modal');
+    if (mask) mask.classList.add('hidden');
+    pendingAction = '';
+  }
+  function submitRename() {
+    const mask = document.getElementById('rename-modal');
+    if (!mask || !pendingAction) return;
+    const input = mask.querySelector('#rename-input');
+    const errEl = mask.querySelector('[data-rename-err]');
+    const name = input ? input.value.trim() : '';
+    if (!name) {
+      if (errEl) { errEl.textContent = '名称不能为空'; errEl.classList.remove('hidden'); }
+      if (input) input.focus();
+      return;
+    }
+    if (name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) {
+      if (errEl) { errEl.textContent = '名称不能包含 / 或 \\'; errEl.classList.remove('hidden'); }
+      if (input) input.focus();
+      return;
+    }
+    if (name.startsWith('.')) {
+      if (errEl) { errEl.textContent = '不能以 . 开头（隐藏项不支持重命名）'; errEl.classList.remove('hidden'); }
+      if (input) input.focus();
+      return;
+    }
+    // 构造表单并提交到 /api/rename/*path
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = pendingAction;
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = 'name';
+    hidden.value = name;
+    form.appendChild(hidden);
+    document.body.appendChild(form);
+    form.submit();
+    pendingAction = '';
+  }
+  // Public API：confirmRename(this, action, currentName)
+  window.confirmRename = function(btn, action, currentName) {
+    if (!action) return;
+    openRenameModal(action, currentName || '');
+  };
+  document.addEventListener('DOMContentLoaded', function() {
+    const mask = document.getElementById('rename-modal');
+    if (!mask) return;
+    mask.addEventListener('click', function(e) {
+      if (e.target === mask) closeRenameModal();
+    });
+    const cancelBtn  = mask.querySelector('[data-rename-cancel]');
+    const confirmBtn = mask.querySelector('[data-rename-confirm]');
+    const input      = mask.querySelector('#rename-input');
+    if (cancelBtn)  cancelBtn.addEventListener('click', closeRenameModal);
+    if (confirmBtn) confirmBtn.addEventListener('click', submitRename);
+    if (input) {
+      input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); submitRename(); }
+        if (e.key === 'Escape') closeRenameModal();
+      });
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && !mask.classList.contains('hidden')) closeRenameModal();
+    });
+  });
+})();

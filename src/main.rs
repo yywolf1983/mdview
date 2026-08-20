@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/save/*path", post(save_file))
         .route("/api/new", post(new_entry))
         .route("/api/delete/*path", post(delete_entry))
+        .route("/api/rename/*path", post(rename_entry))
         .with_state(state);
 
     let listener = TcpListener::bind(&args.addr).await?;
@@ -440,6 +441,68 @@ async fn delete_entry(
     Ok(Redirect::to(&url))
 }
 
+/// 重命名文件 / 目录（移动同一父目录下的名字）
+#[derive(Deserialize, Debug)]
+struct RenameForm {
+    #[serde(default)]
+    name: String,
+}
+
+async fn rename_entry(
+    State(state): State<AppState>,
+    Path(subpath): Path<String>,
+    Form(form): Form<RenameForm>,
+) -> Result<Redirect, (StatusCode, String)> {
+    let target = resolve_path(&state.root, &subpath);
+    if target == state.root {
+        return Err((StatusCode::BAD_REQUEST, "不能重命名根目录".into()));
+    }
+    if !target.starts_with(&state.root) {
+        return Err((StatusCode::FORBIDDEN, "越权重命名".into()));
+    }
+    if !target.exists() {
+        return Err((StatusCode::NOT_FOUND, "目标不存在".into()));
+    }
+    let new_name = form.name.trim().to_string();
+    if new_name.is_empty() || new_name.starts_with('.') {
+        return Err((StatusCode::BAD_REQUEST, "名称不能为空或隐藏名称".into()));
+    }
+    if new_name.contains('/') || new_name.contains('\\') {
+        return Err((StatusCode::BAD_REQUEST, "名称包含非法字符".into()));
+    }
+    let parent = target.parent().unwrap_or(&state.root).to_path_buf();
+    let dest = parent.join(&new_name);
+    // 同名直接跳过（无需移动）
+    if dest == target {
+        let rel = parent.strip_prefix(&state.root).unwrap_or(&state.root);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let url = if rel_str.is_empty() {
+            "/".into()
+        } else {
+            format!("/browse/{}", url_encode_path(&rel_str))
+        };
+        return Ok(Redirect::to(&url));
+    }
+    if dest.exists() {
+        return Err((StatusCode::BAD_REQUEST, "已存在同名文件 / 目录".into()));
+    }
+    fs::rename(&target, &dest).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重命名失败: {}", e),
+        )
+    })?;
+    // 回跳到父目录
+    let rel = parent.strip_prefix(&state.root).unwrap_or(&state.root);
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let url = if rel_str.is_empty() {
+        "/".into()
+    } else {
+        format!("/browse/{}", url_encode_path(&rel_str))
+    };
+    Ok(Redirect::to(&url))
+}
+
 /// 解析路径，防止目录遍历攻击
 fn resolve_path(root: &FsPath, subpath: &str) -> PathBuf {
     let decoded =
@@ -552,8 +615,10 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
             String::new()
         };
         let delete_action = format!("/api/delete/{}", url_encode_path(&f.path));
+        let rename_action = format!("/api/rename/{}", url_encode_path(&f.path));
         let kind = if f.is_dir { "dir" } else { "file" };
         let safe_label = f.name.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;").replace('\'', "&#39;");
+        let safe_name = f.name.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;").replace('\'', "&#39;");
         let del_btn = format!(
             "<form method=\"post\" action=\"{}\" style=\"display:inline\">\
              <button class=\"del-btn\" type=\"button\" title=\"删除\" \
@@ -561,6 +626,12 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
             delete_action,
             label = safe_label,
             kind = kind,
+        );
+        let rename_btn = format!(
+            "<button class=\"ren-btn\" type=\"button\" title=\"重命名\" \
+             onclick=\"confirmRename(this,'{action}','{name}')\">重命名</button>",
+            action = rename_action,
+            name = safe_name,
         );
         html.push_str(&format!(
             r#"<li class="{li_class}">
@@ -570,7 +641,7 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
       <span class="file-name">{name}{badge}</span>
     </span>
   </a>
-  <span class="list-actions">{raw}{del}</span>
+  <span class="list-actions">{raw}{rename}{del}</span>
 </li>"#,
             li_class = class,
             href = href,
@@ -578,6 +649,7 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
             name = f.name.replace('&', "&amp;").replace('<', "&lt;"),
             badge = ext_badge,
             raw = raw_link,
+            rename = rename_btn,
             del = del_btn,
         ));
     }
@@ -608,6 +680,7 @@ fn new_entry_form(parent: &str) -> String {
 fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
     let save_action = format!("/api/save/{}", url_encode_path(rel_path));
     let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let rename_action = format!("/api/rename/{}", url_encode_path(rel_path));
     let filename = rel_path
         .rsplit('/')
         .next()
@@ -621,13 +694,13 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
     // 用在 onclick 单引号字符串里，需要转义单引号
     let filename_js = filename.replace('\'', "&#39;");
     // 编辑器编辑态高亮层（纯文本镜像，行号由 CSS 计数器生成）
-    let line_cnt = raw_content.lines().count();
     let highlight = safe_content.clone();
     format!(
         r#"<div class="card">
   <div class="md-toolbar">
     <button type="button" class="primary" id="btn-edit" onclick="toggleEditor()">✎ 编辑</button>
     <button type="button" class="ghost" onclick="location.href='/raw/{raw_url}'">🔍 原始</button>
+    <button type="button" class="ghost" onclick="confirmRename(this,'{rename_action}','{filename_js}')">✏ 重命名</button>
     <form method="post" action="{delete_action}" style="display:inline">
       <button type="button" class="danger" onclick="confirmDelete(this,'{filename_js}','file')">🗑 删除</button>
     </form>
@@ -650,6 +723,7 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
 </div>"#,
         raw_url = url_encode_path(rel_path),
         delete_action = delete_action,
+        rename_action = rename_action,
         save_action = save_action,
         filename = filename,
         filename_js = filename_js,
@@ -1144,20 +1218,33 @@ fn highlight_code(code: &str, ext: &str, file_name: &str) -> (String, String) {
         let theme = &ts.themes["base16-ocean.light"];
         let html = highlighted_html_for_string(code, ss, syntax, theme)
             .unwrap_or_else(|_| escape_html(code));
-        // 去掉 syntect 自带的最外层 <pre></pre>，仅保留 <code> 内的高亮片段
+        // 去掉 syntect 自带的最外层 <pre ...></pre>，仅保留内部高亮片段。
+        // 注意 syntect 输出的是带属性的 <pre style="...">，不能用 trim_start_matches("<pre>")
+        let html = html.trim_end_matches("</pre>").to_string();
+        let html = if let Some(pos) = html.find('>') {
+            if html.starts_with("<pre") {
+                html[pos + 1..].to_string()
+            } else {
+                html
+            }
+        } else {
+            html
+        };
         html
-            .trim_start_matches("<pre>")
-            .trim_end_matches("</pre>")
-            .trim_end_matches('\n')
-            .to_string()
     };
+    // 去掉首尾换行，避免 syntect 输出在 <pre> 标签后（开头）或末尾带的 \n，
+    // 被 .split('\n') 切出空段，导致查看态头部/尾部多一个空行（编辑层按真实文本渲染不会多）
+    let raw = raw.trim_matches('\n');
 
     // 逐行包裹为 .cl，配合 CSS 计数器生成行号（行号与代码同一元素，严格对齐）
+    // 跳过空行段，避免 syntect 标签间的换行文本被切出空 .cl 导致查看态多出空行
     let mut wrapped = String::with_capacity(raw.len() + raw.lines().count() * 18);
     for line in raw.split('\n') {
-        wrapped.push_str("<div class=\"cl\">");
-        wrapped.push_str(line);
-        wrapped.push_str("</div>");
+        if !line.is_empty() {
+            wrapped.push_str("<div class=\"cl\">");
+            wrapped.push_str(line);
+            wrapped.push_str("</div>");
+        }
     }
     (wrapped, lang)
 }
@@ -1176,6 +1263,7 @@ fn code_view_html(rel_path: &str, name: &str, content: &str, raw: &[u8]) -> Stri
     let back = parent_browse_url(rel_path);
     let save_action = format!("/api/save/{}", url_encode_path(rel_path));
     let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let rename_action = format!("/api/rename/{}", url_encode_path(rel_path));
     let filename = rel_path
         .rsplit('/')
         .next()
@@ -1189,6 +1277,7 @@ fn code_view_html(rel_path: &str, name: &str, content: &str, raw: &[u8]) -> Stri
   <div class="md-toolbar">
     <a class="btn btn-primary" href="{back}">← 返回</a>
     <button type="button" class="primary" id="btn-edit" onclick="toggleEditor()">✎ 编辑</button>
+    <button type="button" class="ghost" onclick="confirmRename(this,'{rename_action}','{label}')">✏ 重命名</button>
     <form method="post" action="{del}" style="display:inline">
       <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
     </form>
@@ -1222,6 +1311,7 @@ fn code_view_html(rel_path: &str, name: &str, content: &str, raw: &[u8]) -> Stri
         back = back,
         save_action = save_action,
         del = delete_action,
+        rename_action = rename_action,
         label = label,
         lang = lang,
         fname = safe_name,
@@ -1243,12 +1333,14 @@ fn image_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> String 
     let static_url = format!("/static/{}", url_encode_path(rel_path));
     let back = parent_browse_url(rel_path);
     let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let rename_action = format!("/api/rename/{}", url_encode_path(rel_path));
     let safe_name = escape_html(name);
     let label = safe_name.replace('\'', "&#39;");
     format!(
         r#"<div class="card">
   <div class="md-toolbar">
     <a class="btn btn-primary" href="{back}">← 返回</a>
+    <button type="button" class="ghost" onclick="confirmRename(this,'{rename_action}','{label}')">✏ 重命名</button>
     <form method="post" action="{del}" style="display:inline">
       <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
     </form>
@@ -1262,6 +1354,7 @@ fn image_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> String 
         back = back,
         static = static_url,
         del = delete_action,
+        rename_action = rename_action,
         label = label,
         ext = ext.to_uppercase(),
         size = size,
@@ -1275,6 +1368,7 @@ fn unsupported_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> S
     let size = format_size(raw.len());
     let back = parent_browse_url(rel_path);
     let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let rename_action = format!("/api/rename/{}", url_encode_path(rel_path));
     let safe_name = escape_html(name);
     let label = safe_name.replace('\'', "&#39;");
     let ext_label: &str = if ext.is_empty() {
@@ -1286,6 +1380,7 @@ fn unsupported_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> S
         r#"<div class="card">
   <div class="md-toolbar">
     <a class="btn btn-primary" href="{back}">← 返回</a>
+    <button type="button" class="ghost" onclick="confirmRename(this,'{rename_action}','{label}')">✏ 重命名</button>
     <form method="post" action="{del}" style="display:inline">
       <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
     </form>
@@ -1300,6 +1395,7 @@ fn unsupported_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> S
 </div>"#,
         back = back,
         del = delete_action,
+        rename_action = rename_action,
         label = label,
         ext = ext_label,
         size = size,

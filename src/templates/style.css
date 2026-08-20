@@ -35,7 +35,7 @@ body {
   font-size: 22px;
   -webkit-font-smoothing: antialiased;
 }
-.shell { max-width: 1060px; margin: 0 auto; padding: 28px 24px 64px; }
+.shell { max-width: 1280px; margin: 0 auto; padding: 28px 24px 64px; }
 .site-header {
   background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #a855f7 100%);
   color: #fff;
@@ -310,6 +310,24 @@ button.ghost:hover {
   transform: none;
   box-shadow: 0 3px 10px rgba(239,68,68,.25);
 }
+.ren-btn {
+  padding: 3px 10px;
+  font-size: 0.78em;
+  color: var(--primary);
+  background: var(--primary-soft, #eef2ff);
+  border-color: #c7d2fe;
+  box-shadow: none;
+  border-radius: 999px;
+  font-weight: 500;
+  margin-right: 6px;
+}
+.ren-btn:hover {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+  transform: none;
+  box-shadow: 0 3px 10px rgba(99,102,241,.25);
+}
 input[type="text"], textarea, input:not([type]) {
   font: inherit;
   border: 1px solid var(--border-strong);
@@ -482,17 +500,16 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
    - 行号与代码是同一行的同一元素(伪元素)，物理上严格对齐、绝不错位、无多余符号
    - 代码 white-space:pre 不软换行，查看与编辑颜色一致、均为浅色 */
 :root {
-  --ln-w: 3.4em;        /* 行号列宽度 */
-  --ln-pad: .9em;       /* 行号到代码文字的间距 */
-  --code-pad-x: 20px;   /* 代码区左右内边距 */
-  --code-pad-y: 16px;   /* 代码区上下内边距 */
+  --ln-w: 2em;          /* 行号列宽度 */
+  --ln-pad: .35em;      /* 行号到代码文字的间距 */
+  --code-pad-x: 10px;   /* 代码区左右内边距 */
+  --code-pad-y: 14px;   /* 代码区上下内边距 */
   --code-line: 1.75;    /* 行高倍数 */
 }
 .editor-body,
 .code-view {
   position: relative;
   overflow: auto;
-  max-height: 78vh;
   background: #ffffff;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -506,6 +523,8 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   margin-bottom: 24px;
   border-color: var(--border-strong);
   box-shadow: var(--shadow);
+  display: grid;            /* 高亮层与 textarea 重叠于同一单元格，cell 高度由内容撑开 */
+  max-height: 78vh;        /* 仅编辑态限制窗口高度，查看态铺满整页随页面滚动 */
 }
 .editor-body:focus-within {
   border-color: #8b5cf6;
@@ -548,13 +567,13 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
    textarea 字体不同，字符宽度不一致，导致光标与高亮文字水平错位、无法定位 */
 .editor-highlight {
   position: relative;
+  grid-area: 1 / 1;
   margin: 0;
   padding: var(--code-pad-y) var(--code-pad-x);
   font-family: inherit;
   font-size: inherit;
   font-variant-ligatures: none;
   letter-spacing: normal;
-  white-space: pre;
   color: #0f172a;
   pointer-events: none;
   z-index: 1;
@@ -575,7 +594,6 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   font-size: inherit;
   font-variant-ligatures: none;
   letter-spacing: normal;
-  white-space: pre;
   overflow: hidden;
   color: #0f172a;
 }
@@ -590,14 +608,15 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   letter-spacing: normal;
   display: block;
 }
-/* 透明 textarea：绝对覆盖在高亮层之上（inset:0 精确重合），仅显示光标，事件落其上
-   左侧内边距 = 代码区内边距 + 行号区宽度，保证光标与高亮文字左对齐；
-   容器高度由底层高亮层(文档流)撑开，textarea 随之铺满，长文件不会截断 */
+/* 透明 textarea：与高亮层重叠于同一 grid 单元格(1/1)，拉伸填满整个内容高度，
+   仅显示光标，事件落其上；左侧内边距 = 代码区内边距 + 行号区宽度，保证光标左对齐 */
 .editor-body #md-editor {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  grid-area: 1 / 1;
+  align-self: stretch;
   z-index: 2;
   width: auto;
+  min-height: 0;
   border: 0;
   padding: var(--code-pad-y) var(--code-pad-x) var(--code-pad-y) calc(var(--code-pad-x) + var(--ln-w) + var(--ln-pad));
   font-family: inherit;
@@ -709,6 +728,31 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   border-top: 1px solid var(--border);
   background: #fafbfc;
 }
+/* ---- Rename Modal ---- */
+.modal-body { padding: 14px 24px 6px; }
+.rename-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  font-size: 15px;
+  font-family: inherit;
+  color: #0f172a;
+  background: #fff;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 10px;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.rename-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(99,102,241,.15);
+}
+.modal-err {
+  margin: 8px 0 0;
+  font-size: .85em;
+  color: var(--danger);
+}
+.modal-err.hidden { display: none; }
 @media (max-width: 640px) {
   .modal-foot { flex-direction: column-reverse; }
   .modal-foot button { width: 100%; justify-content: center; }

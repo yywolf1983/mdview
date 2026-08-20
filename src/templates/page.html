@@ -40,5 +40,26 @@
   </div>
 </div>
 
+<!-- 全局重命名弹窗 -->
+<div id="rename-modal" class="modal-mask hidden" role="dialog" aria-modal="true" aria-labelledby="ren-title">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-icon" aria-hidden="true">✏</div>
+      <div style="flex:1;min-width:0">
+        <h3 class="modal-title" id="ren-title">重命名</h3>
+        <p class="modal-desc">请输入新的文件 / 目录名称：</p>
+      </div>
+    </div>
+    <div class="modal-body">
+      <input type="text" id="rename-input" class="rename-input" placeholder="新名称" autocomplete="off" spellcheck="false">
+      <p class="modal-err hidden" data-rename-err></p>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="ghost" data-rename-cancel>取消</button>
+      <button type="button" class="primary" data-rename-confirm>✏ 确认重命名</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
