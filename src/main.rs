@@ -11,6 +11,10 @@ use pulldown_cmark::{Options, Parser as MdParser};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::OnceLock;
+use syntect::highlighting::ThemeSet;
+use syntect::html::highlighted_html_for_string;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use tokio::net::TcpListener;
 
 /// 启动一个本地 Web 服务器，浏览指定目录下的 Markdown 文件
@@ -36,6 +40,8 @@ struct FileItem {
     name: String,
     path: String, // 相对根目录的路径（使用 /）
     is_dir: bool,
+    /// dir / md / img / code / txt / bin，用于列表图标与操作区分
+    kind: String,
     #[serde(skip)]
     mtime: Option<std::time::SystemTime>, // 用于"最新修改在前"排序（不传到前端）
 }
@@ -67,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("{} 不是一个目录", root.display());
     }
 
-    println!("📖 Markdown 浏览器");
+    println!("📖 文件浏览器（Markdown / 图片 / 代码）");
     println!("   目录: {}", root.display());
     println!("   地址: http://{}", args.addr);
 
@@ -78,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/browse/*path", get(browse))
         .route("/raw/*path", get(raw_view))
         .route("/static/*path", get(static_file))
-        .route("/api/save/*path", post(save_md))
+        .route("/api/save/*path", post(save_file))
         .route("/api/new", post(new_entry))
         .route("/api/delete/*path", post(delete_entry))
         .with_state(state);
@@ -117,7 +123,19 @@ async fn browse(
         return Ok(Html(html));
     }
 
-    if target.is_file() && target.extension().and_then(|e| e.to_str()) == Some("md") {
+    let ext = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled")
+        .to_string();
+    let rel_path = display_rel(&state.root, &target);
+
+    if target.is_file() && ext == "md" {
         match fs::read_to_string(&target) {
             Ok(raw_content) => {
                 let md_html = render_markdown(&raw_content);
@@ -138,7 +156,6 @@ async fn browse(
                     .and_then(|s| s.to_str())
                     .unwrap_or("untitled")
                     .to_string();
-                let rel_path = display_rel(&state.root, &target);
                 let toolbar = md_toolbar(&rel_path, &raw_content);
                 let body = toolbar + "<div class=\"card\">" + &md_html + "</div>";
                 let html = render_page(&title, &breadcrumb(&state.root, &target), &body);
@@ -151,6 +168,30 @@ async fn browse(
                 ));
             }
         }
+    }
+
+    if target.is_file() {
+        let raw = fs::read(&target).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("读取文件失败: {e}"),
+            )
+        })?;
+        let crumb = breadcrumb(&state.root, &target);
+        if is_image_ext(&ext) {
+            // 图片文件：直接预览
+            let body = image_view_html(&rel_path, &name, &raw, &ext);
+            return Ok(Html(render_page(&format!("🖼 {name}"), &crumb, &body)));
+        }
+        if is_text_viewable(&target) {
+            // 文本 / 代码文件：语法高亮查看
+            let content = String::from_utf8_lossy(&raw);
+            let body = code_view_html(&rel_path, &name, &content, &raw);
+            return Ok(Html(render_page(&name, &crumb, &body)));
+        }
+        // 其他文件：显示不支持预览的提示（仅保留删除）
+        let body = unsupported_view_html(&rel_path, &name, &raw, &ext);
+        return Ok(Html(render_page(&name, &crumb, &body)));
     }
 
     Err((StatusCode::NOT_FOUND, "未找到该文件或目录".into()))
@@ -227,20 +268,11 @@ async fn static_file(
 }
 
 /// 保存 Markdown 文件（用于编辑 / 新建已命名的 md）
-async fn save_md(
+async fn save_file(
     State(state): State<AppState>,
     Path(subpath): Path<String>,
     Form(form): Form<SaveForm>,
 ) -> Result<Redirect, (StatusCode, String)> {
-    // 若目标不存在，也允许按路径直接新建；仍需要求扩展名 .md 以避免覆盖其他文件
-    if !subpath
-        .rsplit('/')
-        .next()
-        .map(|f| f.to_ascii_lowercase().ends_with(".md"))
-        .unwrap_or(false)
-    {
-        return Err((StatusCode::BAD_REQUEST, "只能保存 .md 文件".into()));
-    }
     // 父目录必须存在；若 subpath 指向仍不存在的文件，resolve_path 会回退到 root，所以这里手动拼接
     let decoded = urlencoding::decode(&subpath)
         .unwrap_or_else(|_| std::borrow::Cow::Borrowed(&subpath))
@@ -436,13 +468,10 @@ fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
             continue;
         }
         let is_dir = path.is_dir();
-        let is_md = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("md"))
-            .unwrap_or(false);
+        let kind = file_kind(&path);
 
-        if is_dir || is_md {
+        // 目录 + 所有可查看文件（markdown / 图片 / 文本 / 代码）都列出
+        if is_dir || kind != "bin" {
             let rel = path.strip_prefix(root).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             let mtime = entry.metadata().ok().and_then(|md| md.modified().ok());
@@ -450,6 +479,7 @@ fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
                 name,
                 path: rel_str,
                 is_dir,
+                kind: kind.to_string(),
                 mtime,
             });
         }
@@ -471,32 +501,53 @@ fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
     Ok(items)
 }
 
-fn file_list_html(files: &[FileItem], is_root: bool, rel_dir: &str) -> String {
+fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
     let _ = rel_dir;
     if files.is_empty() {
         return r#"<div class="card empty-state">
   <div class="empty-icon">📭</div>
-  <p><strong>此目录下还没有 Markdown 文件</strong></p>
-  <p style="font-size:.9em;color:var(--muted)">使用上方的「新建」按钮来创建第一个文档吧。</p>
+  <p><strong>此目录下还没有可查看的文件</strong></p>
+  <p style="font-size:.9em;color:var(--muted)">使用上方的「新建」按钮来创建文档，或放入 Markdown / 图片 / 代码文件。</p>
 </div>"#
             .to_string();
     }
     let mut html = String::new();
-    if !is_root {
-        html.push_str(
-            "<p style='margin:0 0 12px'><a href='/' style='color:var(--accent);font-weight:500'>← 返回根目录</a></p>",
-        );
-    }
     html.push_str("<div class=\"card\"><ul class='file-list'>");
     for f in files {
         let href = format!("/browse/{}", url_encode_path(&f.path));
-        let icon = if f.is_dir { "📁" } else { "📄" };
+        let icon = match f.kind.as_str() {
+            "dir" => "📁",
+            "md" => "📄",
+            "img" => "🖼",
+            "code" => "💻",
+            "txt" => "📝",
+            _ => "📄",
+        };
         let class = if f.is_dir { "is-dir" } else { "is-file" };
-        let raw_link = if !f.is_dir {
+        // 各类型文件在列表右侧的操作链接：md 显示「原始」，其余指向预览页（不提供下载）
+        let raw_link = if f.is_dir {
+            String::new()
+        } else if f.kind == "md" {
             format!(
                 "<a class='raw' href='/raw/{}'>原始</a>",
                 url_encode_path(&f.path)
             )
+        } else {
+            // 代码 / 图片 / 文本：跳转到对应预览页查看
+            format!(
+                "<a class='raw' href='/browse/{}' title='查看'>查看</a>",
+                url_encode_path(&f.path)
+            )
+        };
+        // 非目录文件显示扩展名小标签
+        let ext_badge = if !f.is_dir {
+            let e = f
+                .path
+                .rsplit('.')
+                .next()
+                .map(|e| format!(".{}", e.to_lowercase()))
+                .unwrap_or_default();
+            format!("<span class=\"ext-badge\">{e}</span>")
         } else {
             String::new()
         };
@@ -516,7 +567,7 @@ fn file_list_html(files: &[FileItem], is_root: bool, rel_dir: &str) -> String {
   <a class="primary-link" href="{href}">
     <span class="file-main">
       <span class="file-icon">{icon}</span>
-      <span class="file-name">{name}</span>
+      <span class="file-name">{name}{badge}</span>
     </span>
   </a>
   <span class="list-actions">{raw}{del}</span>
@@ -525,6 +576,7 @@ fn file_list_html(files: &[FileItem], is_root: bool, rel_dir: &str) -> String {
             href = href,
             icon = icon,
             name = f.name.replace('&', "&amp;").replace('<', "&lt;"),
+            badge = ext_badge,
             raw = raw_link,
             del = del_btn,
         ));
@@ -568,6 +620,9 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
     let size_label = format!("{} 字符", raw_content.chars().count());
     // 用在 onclick 单引号字符串里，需要转义单引号
     let filename_js = filename.replace('\'', "&#39;");
+    // 编辑器编辑态高亮层（纯文本镜像，行号由 CSS 计数器生成）
+    let line_cnt = raw_content.lines().count();
+    let highlight = safe_content.clone();
     format!(
         r#"<div class="card">
   <div class="md-toolbar">
@@ -587,7 +642,10 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
         <button type="submit" class="primary" style="margin-left:6px;">💾 保存</button>
       </div>
     </div>
-    <textarea name="content" id="md-editor" spellcheck="false">{content}</textarea>
+    <div class="editor-body">
+      <pre class="editor-highlight" aria-hidden="true"><code>{highlight}</code></pre>
+      <textarea name="content" id="md-editor" spellcheck="false">{content}</textarea>
+    </div>
   </form>
 </div>"#,
         raw_url = url_encode_path(rel_path),
@@ -595,6 +653,7 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
         save_action = save_action,
         filename = filename,
         filename_js = filename_js,
+        highlight = highlight,
         content = safe_content,
         size = size_label,
     )
@@ -934,6 +993,408 @@ fn inject_heading_ids(html: &str) -> String {
     out.into_iter().collect()
 }
 
+/// 语法高亮用的全局缓存（只加载一次，Sublime Text 语法集 + 内置主题）
+static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+static THEMES: OnceLock<ThemeSet> = OnceLock::new();
+
+/// 超过该字符数的代码文件跳过语法高亮（避免大文件卡顿），直接显示纯文本
+const MAX_HIGHLIGHT_CHARS: usize = 1_500_000;
+
+/// 判断文件在列表/查看页中的类别：dir / md / img / code / txt / bin
+fn file_kind(path: &FsPath) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_image_ext(&ext) {
+        "img"
+    } else if ext == "md" {
+        "md"
+    } else if ext == "txt" || ext == "log" {
+        "txt"
+    } else if is_text_ext(&ext) || has_text_file_name(path) {
+        "code"
+    } else {
+        "bin"
+    }
+}
+
+/// 常见图片扩展名（ext 需为小写）
+fn is_image_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "avif"
+    )
+}
+
+/// 判断是否为可查看的文本 / 代码文件（按扩展名 + 特殊文件名）
+fn is_text_viewable(path: &FsPath) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    is_text_ext(&ext) || has_text_file_name(path)
+}
+
+/// 常见的文本 / 代码扩展名（ext 需为小写）
+fn is_text_ext(ext: &str) -> bool {
+    const TEXTS: &[&str] = &[
+        // 纯文本
+        "txt", "log", "ini", "conf", "cfg", "properties", "csv", "tsv",
+        // C 家族
+        "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "cs",
+        // 主流语言
+        "java", "py", "rs", "js", "mjs", "cjs", "jsx", "ts", "tsx", "css",
+        "html", "htm", "go", "swift", "kt", "kts", "rb", "php", "lua", "sql",
+        // 配置 / 标记
+        "json", "toml", "yaml", "yml", "xml", "sh", "bash", "zsh", "bat",
+        "ps1", "fish", "diff", "patch", "vue", "sass", "scss", "less",
+        // 更多
+        "m", "mm", "pl", "pm", "r", "dart", "gradle", "proto", "awk", "sed",
+        "clj", "cljs", "ex", "exs", "erl", "hrl", "fs", "fsx", "fsi", "hs",
+        "scala", "nim", "zig", "cr", "dockerfile", "lock",
+    ];
+    TEXTS.contains(&ext)
+}
+
+/// 无扩展名的常见构建 / 工程文件名
+fn has_text_file_name(path: &FsPath) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "dockerfile"
+            | "makefile"
+            | "gnumakefile"
+            | "bsdmakefile"
+            | "rakefile"
+            | "gemfile"
+            | "cmakelists.txt"
+            | "vagrantfile"
+            | "procfile"
+            | "justfile"
+    )
+}
+
+/// 人类可读的文件大小
+fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1048576.0)
+    } else {
+        format!("{:.1} GB", bytes as f64 / 1073741824.0)
+    }
+}
+
+/// 父目录的浏览 URL
+fn parent_browse_url(rel: &str) -> String {
+    let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    if parent.is_empty() {
+        "/".into()
+    } else {
+        format!("/browse/{}", url_encode_path(parent))
+    }
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// 按扩展名 / 文件名选择语法
+fn find_syntax<'a>(ss: &'a SyntaxSet, ext: &str, file_name: &str) -> &'a SyntaxReference {
+    let lower = file_name.to_ascii_lowercase();
+    let by_name = match lower.as_str() {
+        "dockerfile" => ss.find_syntax_by_name("Dockerfile"),
+        "makefile" => ss.find_syntax_by_name("Makefile"),
+        "rakefile" => ss.find_syntax_by_name("Ruby"),
+        "cmakelists.txt" => ss.find_syntax_by_name("CMake"),
+        "justfile" => ss.find_syntax_by_name("Justfile"),
+        _ => None,
+    };
+    by_name
+        .or_else(|| ss.find_syntax_by_extension(ext))
+        .or_else(|| ss.find_syntax_by_token(ext))
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
+}
+
+/// 对代码做语法高亮（浅色主题），返回 (纯高亮 HTML 片段, 语言名)
+/// 行号由调用方通过独立的 gutter 列渲染，避免行号占位带来的空白错位
+fn highlight_code(code: &str, ext: &str, file_name: &str) -> (String, String) {
+    let ss = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+    let ts = THEMES.get_or_init(ThemeSet::load_defaults);
+    let syntax = find_syntax(ss, ext, file_name);
+    let lang = syntax.name.clone();
+
+    // 超大文件或在编辑/预览场景都直接用纯文本，避免高亮卡顿
+    let raw = if code.len() > MAX_HIGHLIGHT_CHARS {
+        escape_html(code)
+    } else {
+        // 使用浅色主题，使代码查看与整体页面风格一致（白底深色文字）
+        let theme = &ts.themes["base16-ocean.light"];
+        let html = highlighted_html_for_string(code, ss, syntax, theme)
+            .unwrap_or_else(|_| escape_html(code));
+        // 去掉 syntect 自带的最外层 <pre></pre>，仅保留 <code> 内的高亮片段
+        html
+            .trim_start_matches("<pre>")
+            .trim_end_matches("</pre>")
+            .trim_end_matches('\n')
+            .to_string()
+    };
+
+    // 逐行包裹为 .cl，配合 CSS 计数器生成行号（行号与代码同一元素，严格对齐）
+    let mut wrapped = String::with_capacity(raw.len() + raw.lines().count() * 18);
+    for line in raw.split('\n') {
+        wrapped.push_str("<div class=\"cl\">");
+        wrapped.push_str(line);
+        wrapped.push_str("</div>");
+    }
+    (wrapped, lang)
+}
+
+/// 生成独立行号列 HTML（每个行号占一行，与代码严格对齐）
+/// 文本 / 代码文件查看页
+fn code_view_html(rel_path: &str, name: &str, content: &str, raw: &[u8]) -> String {
+    let size = format_size(raw.len());
+    let line_cnt = content.lines().count();
+    let ext = rel_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (code_html, lang) = highlight_code(content, &ext, name);
+    let back = parent_browse_url(rel_path);
+    let save_action = format!("/api/save/{}", url_encode_path(rel_path));
+    let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let filename = rel_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(rel_path)
+        .replace('"', "&quot;");
+    let safe_name = escape_html(name);
+    let label = safe_name.replace('\'', "&#39;");
+    let safe_content = escape_html(content);
+    format!(
+        r#"<div class="card">
+  <div class="md-toolbar">
+    <a class="btn btn-primary" href="{back}">← 返回</a>
+    <button type="button" class="primary" id="btn-edit" onclick="toggleEditor()">✎ 编辑</button>
+    <form method="post" action="{del}" style="display:inline">
+      <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
+    </form>
+    <div class="spacer"></div>
+    <span class="status-pill">{lang} · {lines} 行 · {size}</span>
+  </div>
+  <h1 style="margin:.2em 0 .6em;font-size:1.25em">{name_esc}</h1>
+  <form id="editor-form" class="editor-form hidden" method="post" action="{save_action}">
+    <div class="editor-head">
+      <span class="label">{filename}</span>
+      <div>
+        <button type="button" class="ghost" onclick="toggleEditor()">取消</button>
+        <button type="submit" class="primary" style="margin-left:6px;">💾 保存</button>
+      </div>
+    </div>
+    <div class="editor-body">
+      <pre class="editor-highlight" aria-hidden="true"><code>{content_esc}</code></pre>
+      <textarea name="content" id="md-editor" spellcheck="false">{content_esc}</textarea>
+    </div>
+  </form>
+  <div class="code-view-title">
+    <span class="dot"></span>
+    <span class="fname">{fname}</span>
+    <span class="lang-tag">{lang}</span>
+  </div>
+  <div class="code-view">
+    <pre class="code-body"><code>{code_html}</code></pre>
+  </div>
+  </div>
+</div>"#,
+        back = back,
+        save_action = save_action,
+        del = delete_action,
+        label = label,
+        lang = lang,
+        fname = safe_name,
+        lines = line_cnt,
+        size = size,
+        name_esc = safe_name,
+        filename = filename,
+        content_esc = safe_content,
+        code_html = code_html,
+    )
+}
+
+/// 图片查看页（仅查看，不提供下载）
+fn image_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> String {
+    let size = format_size(raw.len());
+    let dims = image_dimensions(raw, ext)
+        .map(|(w, h)| format!(" · {w}×{h}"))
+        .unwrap_or_default();
+    let static_url = format!("/static/{}", url_encode_path(rel_path));
+    let back = parent_browse_url(rel_path);
+    let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let safe_name = escape_html(name);
+    let label = safe_name.replace('\'', "&#39;");
+    format!(
+        r#"<div class="card">
+  <div class="md-toolbar">
+    <a class="btn btn-primary" href="{back}">← 返回</a>
+    <form method="post" action="{del}" style="display:inline">
+      <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
+    </form>
+    <div class="spacer"></div>
+    <span class="status-pill">{ext} · {size}{dims}</span>
+  </div>
+  <div class="image-view">
+    <a href="{static}" target="_blank" title="点击放大"><img src="{static}" alt="{alt}" loading="lazy"></a>
+  </div>
+</div>"#,
+        back = back,
+        static = static_url,
+        del = delete_action,
+        label = label,
+        ext = ext.to_uppercase(),
+        size = size,
+        dims = dims,
+        alt = safe_name,
+    )
+}
+
+/// 暂不支持预览的文件：显示提示（仅保留删除）
+fn unsupported_view_html(rel_path: &str, name: &str, raw: &[u8], ext: &str) -> String {
+    let size = format_size(raw.len());
+    let back = parent_browse_url(rel_path);
+    let delete_action = format!("/api/delete/{}", url_encode_path(rel_path));
+    let safe_name = escape_html(name);
+    let label = safe_name.replace('\'', "&#39;");
+    let ext_label: &str = if ext.is_empty() {
+        "未知类型"
+    } else {
+        &ext.to_uppercase()
+    };
+    format!(
+        r#"<div class="card">
+  <div class="md-toolbar">
+    <a class="btn btn-primary" href="{back}">← 返回</a>
+    <form method="post" action="{del}" style="display:inline">
+      <button class="del-btn" type="button" title="删除" onclick="confirmDelete(this,'{label}','file')">🗑 删除</button>
+    </form>
+    <div class="spacer"></div>
+    <span class="status-pill">{ext} · {size}</span>
+  </div>
+  <div class="download-view">
+    <div class="empty-icon">📦</div>
+    <p><strong>{name_esc}</strong></p>
+    <p style="font-size:.9em;color:var(--muted)">该文件类型暂不支持在线预览或编辑。</p>
+  </div>
+</div>"#,
+        back = back,
+        del = delete_action,
+        label = label,
+        ext = ext_label,
+        size = size,
+        name_esc = safe_name,
+    )
+}
+
+/// 解析常见图片格式（png / jpeg / gif / webp / bmp）的宽高
+fn image_dimensions(bytes: &[u8], ext: &str) -> Option<(u32, u32)> {
+    match ext {
+        "png" => {
+            if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                Some((
+                    u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+                    u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+                ))
+            } else {
+                None
+            }
+        }
+        "jpg" | "jpeg" => {
+            // 逐个扫描 JPEG 段，在 SOFn 段读取宽高
+            let mut i = 2usize;
+            while i + 9 <= bytes.len() {
+                if bytes[i] != 0xFF {
+                    i += 1;
+                    continue;
+                }
+                let marker = bytes[i + 1];
+                // 跳过无数据段标记
+                if marker == 0xD8 || marker == 0xFF || (0xD0..=0xD7).contains(&marker) {
+                    i += 2;
+                    continue;
+                }
+                if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+                    let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
+                    let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]);
+                    return Some((w as u32, h as u32));
+                }
+                if i + 4 > bytes.len() {
+                    break;
+                }
+                let seg_len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+                if seg_len < 2 {
+                    break;
+                }
+                i += 2 + seg_len;
+            }
+            None
+        }
+        "gif" => {
+            if bytes.len() >= 10 && (bytes.starts_with(b"GIF89a") || bytes.starts_with(b"GIF87a")) {
+                Some((
+                    u16::from_le_bytes([bytes[6], bytes[7]]) as u32,
+                    u16::from_le_bytes([bytes[8], bytes[9]]) as u32,
+                ))
+            } else {
+                None
+            }
+        }
+        "webp" => {
+            if bytes.len() >= 30 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+                if &bytes[12..16] == b"VP8 " {
+                    Some((
+                        (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32,
+                        (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32,
+                    ))
+                } else if &bytes[12..16] == b"VP8L" && bytes.len() >= 25 {
+                    let b0 = bytes[21] as u32;
+                    let b1 = bytes[22] as u32;
+                    let b2 = bytes[23] as u32;
+                    let b3 = bytes[24] as u32;
+                    let w = 1 + (((b1 & 0x3F) << 8) | b0);
+                    let h = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6));
+                    Some((w, h))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "bmp" => {
+            if bytes.len() >= 26 && bytes.starts_with(b"BM") {
+                let w = i32::from_le_bytes(bytes[18..22].try_into().ok()?);
+                let h = i32::from_le_bytes(bytes[22..26].try_into().ok()?);
+                Some((w.unsigned_abs(), h.unsigned_abs()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 根据扩展名简单推断 MIME 类型
 fn guess_content_type(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
@@ -948,6 +1409,7 @@ fn guess_content_type(ext: &str) -> &'static str {
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
         "webp" => "image/webp",
+        "avif" => "image/avif",
         "ico" => "image/x-icon",
         "bmp" => "image/bmp",
         "pdf" => "application/pdf",
@@ -964,838 +1426,18 @@ fn guess_content_type(ext: &str) -> &'static str {
     }
 }
 
+/// 页面的 HTML 骨架模板（编译期嵌入）。占位符在 render_page 中替换。
+const PAGE_TEMPLATE: &str = include_str!("templates/page.html");
+/// 全部 CSS 样式（编译期嵌入）。
+const STYLE_CSS: &str = include_str!("templates/style.css");
+/// 全部前端 JS（编译期嵌入）。
+const APP_JS: &str = include_str!("templates/app.js");
+
 fn render_page(title: &str, breadcrumb: &str, body: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  :root {{
-    --bg: #f6f8fb;
-    --bg-grad-a: #eef2ff;
-    --bg-grad-b: #fdf2ff;
-    --card: #ffffff;
-    --fg: #1f2328;
-    --muted: #57606a;
-    --border: #e2e6ec;
-    --border-strong: #cfd5de;
-    --link: #0969da;
-    --link-hover: #0550ae;
-    --accent: #6d28d9;
-    --accent-soft: #ede9fe;
-    --danger: #cf222e;
-    --danger-soft: #ffe8e6;
-    --success: #1a7f37;
-    --warning: #9a6700;
-    --radius: 12px;
-    --radius-sm: 8px;
-    --shadow-sm: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
-    --shadow: 0 4px 10px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.06);
-    --shadow-lg: 0 10px 30px rgba(16,24,40,.08), 0 24px 60px rgba(16,24,40,.08);
-  }}
-  * {{ box-sizing: border-box; }}
-  html, body {{ margin: 0; padding: 0; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Helvetica, Arial, sans-serif;
-    color: var(--fg);
-    background:
-      radial-gradient(1200px 600px at 10% -10%, var(--bg-grad-a) 0%, transparent 60%),
-      radial-gradient(1000px 500px at 110% 10%, var(--bg-grad-b) 0%, transparent 55%),
-      var(--bg);
-    min-height: 100vh;
-    line-height: 1.7;
-    font-size: 22px;
-    -webkit-font-smoothing: antialiased;
-  }}
-  .shell {{ max-width: 1060px; margin: 0 auto; padding: 28px 24px 64px; }}
-  .site-header {{
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: #fff;
-    border-radius: 16px;
-    padding: 22px 26px;
-    box-shadow: var(--shadow);
-    margin-bottom: 22px;
-    position: relative;
-    overflow: hidden;
-  }}
-  .site-header::after {{
-    content: ""; position: absolute; right: -40px; top: -60px;
-    width: 260px; height: 260px; border-radius: 50%;
-    background: rgba(255,255,255,0.12);
-    filter: blur(2px);
-  }}
-  .site-header::before {{
-    content: ""; position: absolute; left: -20px; bottom: -80px;
-    width: 220px; height: 220px; border-radius: 50%;
-    background: rgba(255,255,255,0.08);
-  }}
-  .site-header h1 {{
-    margin: 0 0 6px; font-size: 20px; font-weight: 700;
-    display: flex; align-items: center; gap: 10px; position: relative; z-index: 1;
-  }}
-  .site-header h1 .logo {{
-    width: 30px; height: 30px; border-radius: 8px;
-    background: rgba(255,255,255,0.22);
-    display: inline-flex; align-items: center; justify-content: center;
-    backdrop-filter: blur(4px);
-    font-size: 16px;
-  }}
-  .breadcrumb {{
-    font-size: 0.88em; color: rgba(255,255,255,0.85);
-    margin: 0; position: relative; z-index: 1;
-  }}
-  .breadcrumb a {{ color: #fff; opacity: 0.95; text-decoration: none; border-bottom: 1px dashed rgba(255,255,255,0.6); padding-bottom: 1px; }}
-  .breadcrumb a:hover {{ opacity: 1; border-bottom-style: solid; }}
-  .breadcrumb span {{ color: #fff; font-weight: 500; opacity: 0.95; }}
-
-  .card {{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow-sm);
-    padding: 22px 26px;
-    margin-bottom: 22px;
-    transition: box-shadow .25s ease, transform .25s ease;
-  }}
-  .card:hover {{ box-shadow: var(--shadow); }}
-
-  /* ---- Typography ---- */
-  h1, h2, h3, h4, h5, h6 {{
-    font-weight: 700; line-height: 1.3; margin: 1.8em 0 .8em;
-    color: #111827;
-  }}
-  .md-body h1 {{ font-size: 1.9em; border-bottom: 1px solid var(--border); padding-bottom: .35em; }}
-  .md-body h2 {{ font-size: 1.45em; border-bottom: 1px solid var(--border); padding-bottom: .3em; }}
-  .md-body h3 {{ font-size: 1.2em; }}
-  .md-body h4 {{ font-size: 1.05em; }}
-  .md-body p {{ margin: .9em 0; }}
-  a {{ color: var(--link); text-decoration: none; transition: color .15s ease; }}
-  a:hover {{ color: var(--link-hover); text-decoration: underline; }}
-  hr {{ border: 0; border-top: 1px dashed var(--border); margin: 2em 0; }}
-  img {{ max-width: 100%; border-radius: var(--radius-sm); box-shadow: var(--shadow-sm); }}
-
-  /* ---- Code ---- */
-  code {{
-    background: #f3f4f6;
-    color: #be185d;
-    padding: 2px 7px;
-    border-radius: 6px;
-    font-size: 0.88em;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    border: 1px solid #eaecf0;
-  }}
-  pre {{
-    background:
-      linear-gradient(180deg, #0f172a 0%, #111827 100%);
-    color: #e5e7eb;
-    padding: 18px 20px;
-    border-radius: var(--radius);
-    overflow: auto;
-    line-height: 1.65;
-    box-shadow: var(--shadow-sm);
-    border: 1px solid #1e293b;
-    font-size: 0.88em;
-  }}
-  pre code {{
-    background: transparent;
-    color: inherit;
-    border: 0;
-    padding: 0;
-    font-size: inherit;
-  }}
-
-  /* ---- Blockquote ---- */
-  blockquote {{
-    border-left: 4px solid transparent;
-    border-image: linear-gradient(180deg, #6366f1, #a855f7) 1;
-    background: linear-gradient(90deg, #f5f3ff 0%, #ffffff 60%);
-    padding: 10px 18px;
-    margin: 1.2em 0;
-    color: #4b5563;
-    border-radius: 0 10px 10px 0;
-    box-shadow: var(--shadow-sm);
-  }}
-  blockquote p:first-child {{ margin-top: 0; }}
-  blockquote p:last-child {{ margin-bottom: 0; }}
-
-  /* ---- Table ---- */
-  .md-body table {{
-    border-collapse: separate;
-    border-spacing: 0;
-    width: 100%;
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    box-shadow: 0 0 0 1px var(--border);
-    margin: 1.2em 0;
-    font-size: 0.95em;
-  }}
-  .md-body th, .md-body td {{
-    padding: 10px 14px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-  }}
-  .md-body th {{
-    background: linear-gradient(180deg, #f8fafc, #f1f5f9);
-    color: #0f172a;
-    font-weight: 600;
-  }}
-  .md-body tbody tr:nth-child(even) td {{ background: #fafbfc; }}
-  .md-body tbody tr:hover td {{ background: #eef2ff; }}
-  .md-body tbody tr:last-child td {{ border-bottom: 0; }}
-
-  /* ---- Task list ---- */
-  .md-body ul {{ padding-left: 1.4em; }}
-  .md-body li {{ margin: .25em 0; }}
-  .md-body li input[type="checkbox"] {{
-    appearance: none; -webkit-appearance: none;
-    width: 16px; height: 16px; border: 1.5px solid var(--border-strong);
-    border-radius: 4px; display: inline-block; vertical-align: -3px; margin-right: 6px;
-    position: relative; background: #fff;
-  }}
-  .md-body li input[type="checkbox"]:checked {{
-    background: linear-gradient(135deg, #6366f1, #8b5cf6);
-    border-color: transparent;
-  }}
-  .md-body li input[type="checkbox"]:checked::after {{
-    content: ""; position: absolute; left: 4px; top: 1px;
-    width: 5px; height: 9px; border: solid white;
-    border-width: 0 2px 2px 0; transform: rotate(45deg);
-  }}
-
-  /* ---- Buttons ---- */
-  button {{
-    cursor: pointer;
-    border: 1px solid var(--border-strong);
-    background: #fff;
-    color: var(--fg);
-    padding: 7px 14px;
-    border-radius: 999px;
-    font-size: 0.88em;
-    font-weight: 500;
-    transition: all .18s ease;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    box-shadow: 0 1px 2px rgba(16,24,40,.04);
-  }}
-  button:hover {{
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(16,24,40,.08);
-    background: #f9fafb;
-  }}
-  button:active {{ transform: translateY(0); box-shadow: none; }}
-
-  /* a-tag buttons (用于返回按钮等) */
-  .btn {{
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 7px 14px;
-    border-radius: 999px;
-    font-size: .88em;
-    font-weight: 500;
-    border: 1px solid var(--border-strong);
-    background: #fff;
-    color: var(--fg);
-    cursor: pointer;
-    transition: all .18s ease;
-    text-decoration: none;
-    box-shadow: 0 1px 2px rgba(16,24,40,.04);
-  }}
-  .btn:hover {{ transform: translateY(-1px); text-decoration: none; }}
-  .btn-primary {{
-    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-    color: #fff; border-color: transparent;
-    box-shadow: 0 6px 16px rgba(99,102,241,.35);
-  }}
-  .btn-primary:hover {{
-    color: #fff;
-    box-shadow: 0 8px 22px rgba(99,102,241,.45);
-  }}
-
-  /* Raw view code block */
-  .raw-pre {{
-    background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
-    color: #0f172a !important;
-    border: 1px solid var(--border) !important;
-    box-shadow: inset 0 1px 0 #fff, var(--shadow-sm);
-    font-size: .88em;
-    line-height: 1.7;
-    padding: 20px 22px !important;
-    border-radius: var(--radius) !important;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    white-space: pre-wrap;
-    word-break: break-word;
-    margin: 0 0 6px !important;
-  }}
-
-  button.primary {{
-    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-    color: #fff; border-color: transparent;
-    box-shadow: 0 6px 16px rgba(99,102,241,.35);
-  }}
-  button.primary:hover {{ box-shadow: 0 8px 22px rgba(99,102,241,.45); }}
-  button.danger {{
-    background: linear-gradient(135deg, #ef4444 0%, #f97316 100%);
-    color: #fff; border-color: transparent;
-    box-shadow: 0 6px 14px rgba(239,68,68,.3);
-  }}
-  button.danger:hover {{ box-shadow: 0 8px 20px rgba(239,68,68,.4); }}
-  button.ghost {{
-    background: transparent;
-    border-color: transparent;
-    color: var(--muted);
-    box-shadow: none;
-  }}
-  button.ghost:hover {{
-    background: #f3f4f6;
-    color: var(--fg);
-    box-shadow: none;
-    transform: none;
-  }}
-  .del-btn {{
-    padding: 3px 10px;
-    font-size: 0.78em;
-    color: var(--danger);
-    background: var(--danger-soft);
-    border-color: #fecaca;
-    box-shadow: none;
-    border-radius: 999px;
-    font-weight: 500;
-  }}
-  .del-btn:hover {{
-    background: var(--danger);
-    color: #fff;
-    border-color: var(--danger);
-    transform: none;
-    box-shadow: 0 3px 10px rgba(239,68,68,.25);
-  }}
-  input[type="text"], textarea, input:not([type]) {{
-    font: inherit;
-    border: 1px solid var(--border-strong);
-    background: #fff;
-    border-radius: 10px;
-    padding: 8px 12px;
-    transition: border-color .18s ease, box-shadow .18s ease;
-    color: var(--fg);
-    outline: none;
-  }}
-  input[type="text"]:focus, textarea:focus {{
-    border-color: #8b5cf6;
-    box-shadow: 0 0 0 4px rgba(139,92,246,.15);
-  }}
-  input[type="checkbox"] {{
-    accent-color: #8b5cf6;
-    transform: scale(1.1);
-  }}
-
-  /* ---- New form ---- */
-  .new-form .card {{ padding: 14px 18px; margin-bottom: 18px; }}
-  .new-form form {{
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-  }}
-  .new-form input[type="text"] {{ flex: 1; min-width: 200px; }}
-  .new-form label.check {{
-    display: inline-flex; align-items: center; gap: 6px;
-    color: var(--muted); font-size: 0.88em;
-    padding: 4px 12px 4px 8px;
-    background: #f9fafb;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    user-select: none;
-    transition: all .15s ease;
-    cursor: pointer;
-  }}
-  .new-form label.check:hover {{ background: #eef2ff; border-color: #c7d2fe; color: var(--accent); }}
-
-  /* ---- File list ---- */
-  ul.file-list {{
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }}
-  ul.file-list li {{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 16px;
-    background: #fff;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    transition: all .2s ease;
-  }}
-  ul.file-list li:hover {{
-    border-color: #c7d2fe;
-    background: linear-gradient(90deg, #faf5ff 0%, #fff 60%);
-    transform: translateX(4px);
-    box-shadow: var(--shadow-sm);
-  }}
-  ul.file-list li .file-main {{
-    display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0;
-  }}
-  ul.file-list li .file-icon {{
-    width: 38px; height: 38px; border-radius: 10px;
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 18px; flex-shrink: 0;
-    box-shadow: inset 0 0 0 1px var(--border);
-  }}
-  ul.file-list li.is-dir .file-icon {{
-    background: linear-gradient(135deg, #fde68a 0%, #fcd34d 100%);
-    color: #92400e;
-    box-shadow: 0 4px 10px rgba(252,211,77,.35), inset 0 0 0 1px rgba(255,255,255,.4);
-    border: 0;
-  }}
-  ul.file-list li.is-file .file-icon {{
-    background: linear-gradient(135deg, #bae6fd 0%, #a5b4fc 100%);
-    color: #1e40af;
-    box-shadow: 0 4px 10px rgba(165,180,252,.4), inset 0 0 0 1px rgba(255,255,255,.4);
-    border: 0;
-  }}
-  ul.file-list li .file-name {{
-    font-weight: 600; color: #111827;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }}
-  ul.file-list li a.primary-link {{
-    color: inherit; text-decoration: none;
-    display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0;
-  }}
-  ul.file-list li a.primary-link:hover {{ text-decoration: none; }}
-  ul.file-list li a.primary-link:hover .file-name {{ color: var(--link); }}
-  .list-actions {{
-    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
-  }}
-  .raw {{
-    color: var(--muted);
-    font-size: 0.8em;
-    padding: 3px 10px;
-    background: #f3f4f6;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    transition: all .15s ease;
-  }}
-  .raw:hover {{ background: var(--accent-soft); color: var(--accent); border-color: #ddd6fe; }}
-  .empty-state {{
-    text-align: center; padding: 50px 20px; color: var(--muted);
-  }}
-  .empty-state .empty-icon {{
-    font-size: 56px; margin-bottom: 10px; opacity: .75;
-  }}
-  .empty-state p {{ margin: 4px 0; }}
-
-  /* ---- Toolbar + Editor ---- */
-  .md-toolbar {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    margin-bottom: 18px;
-    background: linear-gradient(90deg, #faf5ff, #eff6ff);
-    border: 1px solid #e0e7ff;
-    border-radius: var(--radius);
-  }}
-  .md-toolbar .spacer {{ flex: 1; }}
-  .md-toolbar .status-pill {{
-    font-size: 0.8em;
-    color: var(--muted);
-    padding: 3px 10px;
-    border-radius: 999px;
-    background: #fff;
-    border: 1px solid var(--border);
-  }}
-  .editor-form {{
-    margin-bottom: 24px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    background:
-      linear-gradient(90deg, #f1f5f9 0 48px, transparent 48px),
-      #ffffff;
-    overflow: hidden;
-    box-shadow: var(--shadow);
-    transition: all .25s ease;
-  }}
-  .editor-form:focus-within {{
-    border-color: #8b5cf6;
-    box-shadow: 0 0 0 4px rgba(139,92,246,.12), var(--shadow-lg);
-  }}
-  .editor-head {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 16px;
-    background: #f8fafc;
-    border-bottom: 1px solid var(--border);
-  }}
-  .editor-head .label {{
-    display: inline-flex; align-items: center; gap: 6px;
-    color: var(--muted); font-size: 0.85em; font-weight: 500;
-  }}
-  .editor-head .label::before {{
-    content: ""; width: 10px; height: 10px; border-radius: 50%;
-    background: linear-gradient(135deg, #f87171, #fbbf24, #34d399);
-    box-shadow: 0 0 0 1px rgba(0,0,0,.06);
-  }}
-  #md-editor {{
-    display: block;
-    width: 100%;
-    min-height: 60vh;
-    background: transparent;
-    border: 0;
-    border-radius: 0;
-    padding: 14px 20px 14px 64px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.92em;
-    line-height: 1.7;
-    color: #0f172a;
-    resize: vertical;
-    outline: none;
-    box-shadow: none;
-  }}
-  #md-editor:focus {{ border: 0; box-shadow: none; }}
-
-  .hidden {{ display: none !important; }}
-
-  /* ---- Delete Confirm Modal ---- */
-  .modal-mask {{
-    position: fixed; inset: 0; z-index: 9999;
-    background: rgba(15, 23, 42, 0.55);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
-    display: flex; align-items: center; justify-content: center;
-    padding: 20px;
-    animation: fadeIn .2s ease;
-  }}
-  .modal-mask.hidden {{ display: none; }}
-  @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
-  @keyframes popIn {{ from {{ transform: scale(.92) translateY(10px); opacity: 0; }} to {{ transform: none; opacity: 1; }} }}
-  .modal-card {{
-    background: #fff;
-    border-radius: 16px;
-    width: 100%; max-width: 440px;
-    box-shadow: 0 30px 80px rgba(15,23,42,.35);
-    overflow: hidden;
-    animation: popIn .22s cubic-bezier(.2,.9,.3,1.2);
-    border: 1px solid var(--border);
-  }}
-  .modal-head {{
-    padding: 22px 24px 6px;
-    display: flex; align-items: flex-start; gap: 14px;
-  }}
-  .modal-icon {{
-    flex-shrink: 0;
-    width: 48px; height: 48px; border-radius: 50%;
-    background: radial-gradient(circle at 30% 30%, #fecaca, #fee2e2 60%);
-    color: var(--danger);
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 24px;
-    box-shadow: 0 6px 16px rgba(239,68,68,.3), inset 0 0 0 1px rgba(255,255,255,.8);
-  }}
-  .modal-title {{ margin: 2px 0 4px; font-size: 18px; font-weight: 700; color: #0f172a; }}
-  .modal-desc {{ margin: 0; color: var(--muted); font-size: .95em; line-height: 1.6; }}
-  .modal-target {{
-    display: inline-block; margin-top: 8px;
-    background: var(--danger-soft);
-    color: var(--danger);
-    border: 1px solid #fecaca;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-size: .82em;
-    font-weight: 600;
-    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }}
-  .modal-foot {{
-    padding: 16px 24px 22px;
-    display: flex; justify-content: flex-end; gap: 10px;
-    border-top: 1px solid var(--border);
-    background: #fafbfc;
-  }}
-  @media (max-width: 640px) {{
-    .modal-foot {{ flex-direction: column-reverse; }}
-    .modal-foot button {{ width: 100%; justify-content: center; }}
-  }}
-
-  /* ---- Responsive ---- */
-  @media (max-width: 640px) {{
-    .shell {{ padding: 16px 12px 40px; }}
-    .site-header {{ padding: 16px 18px; border-radius: 12px; }}
-    .card {{ padding: 16px; }}
-    ul.file-list li {{ flex-direction: column; align-items: stretch; gap: 8px; }}
-    ul.file-list li .list-actions {{ justify-content: flex-end; }}
-    .new-form form {{ flex-direction: column; align-items: stretch; }}
-    .new-form button.primary {{ align-self: flex-start; }}
-    #back-top {{ right: 16px; bottom: 16px; width: 44px; height: 44px; }}
-  }}
-
-  /* ---- Floating Back to Top ---- */
-  #back-top {{
-    position: fixed;
-    right: 28px;
-    bottom: 32px;
-    width: 52px;
-    height: 52px;
-    border-radius: 999px;
-    border: 1px solid rgba(255,255,255,.7);
-    background: linear-gradient(135deg, rgba(109,40,217,.92), rgba(219,39,119,.88));
-    color: #fff;
-    font-size: 22px;
-    line-height: 1;
-    display: inline-flex; align-items: center; justify-content: center;
-    box-shadow: 0 14px 32px rgba(109,40,217,.32), 0 2px 6px rgba(15,23,42,.08), inset 0 0 0 1px rgba(255,255,255,.35);
-    backdrop-filter: saturate(160%) blur(10px);
-    -webkit-backdrop-filter: saturate(160%) blur(10px);
-    z-index: 9999;
-    cursor: pointer;
-    opacity: 0;
-    transform: translateY(16px) scale(.82);
-    pointer-events: none;
-    transition: opacity .22s ease, transform .24s cubic-bezier(.2,.9,.3,1.2), box-shadow .18s;
-    -webkit-tap-highlight-color: transparent;
-  }}
-  #back-top:hover {{ box-shadow: 0 18px 40px rgba(219,39,119,.34), 0 2px 8px rgba(15,23,42,.12), inset 0 0 0 1px rgba(255,255,255,.5); }}
-  #back-top:active {{ transform: translateY(10px) scale(.96); }}
-  #back-top.show {{
-    opacity: 1;
-    transform: none;
-    pointer-events: auto;
-  }}
-  @media (prefers-reduced-motion: reduce) {{
-    #back-top {{ transition: opacity .15s linear; }}
-  }}
-</style>
-<script>
-/* ---------- Floating Back to Top ---------- */
-(function(){{
-  const THRESHOLD = 360;
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.id = 'back-top';
-  btn.title = '回到顶部';
-  btn.setAttribute('aria-label', '回到顶部');
-  btn.innerHTML = '⤴';
-  btn.addEventListener('click', function() {{
-    try {{ window.scrollTo({{top:0, behavior:'smooth'}}); }}
-    catch(_) {{ window.scrollTo(0,0); }}
-  }});
-  document.addEventListener('DOMContentLoaded', function() {{
-    document.body.appendChild(btn);
-    var ticking = false;
-    function update() {{
-      var y = window.scrollY || document.documentElement.scrollTop || 0;
-      if (y >= THRESHOLD) btn.classList.add('show');
-      else btn.classList.remove('show');
-      ticking = false;
-    }}
-    update();
-    window.addEventListener('scroll', function() {{
-      if (!ticking) {{
-        window.requestAnimationFrame ? requestAnimationFrame(update) : setTimeout(update, 16);
-        ticking = true;
-      }}
-    }}, {{ passive: true }});
-    window.addEventListener('resize', function() {{
-      if (!ticking) {{ requestAnimationFrame ? requestAnimationFrame(update) : setTimeout(update, 16); ticking = true; }}
-    }}, {{ passive: true }});
-  }});
-  // DOMContentLoaded 可能已经过去（脚本放在 body 前）也兜底一次
-  if (document.readyState === 'interactive' || document.readyState === 'complete') {{
-    if (!document.getElementById('back-top')) document.body.appendChild(btn);
-  }}
-}})();
-
-/* ---------- Anchor / Heading 模糊匹配（中文标点差异） ---------- */
-(function(){{
-  function normHash(s) {{
-    // 与后端 normalize_for_match 保持一致：去掉一切非 CJK/ASCII 字母数字的字符
-    // 注意：fragment 可能包含 %XX，先 decode。
-    let t = '';
-    try {{ t = decodeURIComponent(s); }} catch(_) {{ t = s; }}
-    if (t.startsWith('#')) t = t.slice(1);
-    return t.replace(/[^0-9A-Za-z\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u3005-\u3006]/g, '').toLowerCase();
-  }}
-  function tryScrollToHash(raw) {{
-    if (!raw) return false;
-    let frag = raw;
-    try {{ frag = decodeURIComponent(raw); }} catch(_) {{ frag = raw; }}
-    if (frag.startsWith('#')) frag = frag.slice(1);
-    // 1. 原生精确匹配（id）
-    const byId = document.getElementById(frag);
-    if (byId) {{ byId.scrollIntoView({{behavior:'smooth',block:'start'}}); return true; }}
-    // 1b. 按 name 属性（老写法）
-    try {{
-      const esc = frag ? CSS.escape(frag) : '';
-      if (esc) {{
-        const sel = 'a[name=' + esc + ']';
-        const byName = document.querySelector(sel);
-        if (byName) {{ byName.scrollIntoView({{behavior:'smooth',block:'start'}}); return true; }}
-      }}
-    }} catch(_) {{}}
-    // 2. 模糊匹配：按 data-anchor-stripped（归一化 key）
-    const need = normHash(raw);
-    if (!need) return false;
-    const headings = document.querySelectorAll('h1,h2,h3,h4,h5,h6');
-    for (let i=0;i<headings.length;i++) {{
-      const h = headings[i];
-      const s = h.getAttribute('data-anchor-stripped') || '';
-      if (s && s === need) {{
-        h.scrollIntoView({{behavior:'smooth',block:'start'}});
-        history.replaceState(null, '', '#' + encodeURIComponent(frag));
-        return true;
-      }}
-    }}
-    // 2b. slug 里把 '-' 都去掉后与 need 比较（id='六-治疗体系' vs need='六治疗体系'）
-    for (let i=0;i<headings.length;i++) {{
-      const h = headings[i];
-      const id = (h.getAttribute('id') || '').replace(/-/g,'').toLowerCase();
-      if (id === need) {{
-        h.scrollIntoView({{behavior:'smooth',block:'start'}});
-        history.replaceState(null, '', '#' + encodeURIComponent(frag));
-        return true;
-      }}
-      const s = (h.getAttribute('data-anchor-stripped') || '').replace(/-/g,'').toLowerCase();
-      if (s === need) {{
-        h.scrollIntoView({{behavior:'smooth',block:'start'}});
-        history.replaceState(null, '', '#' + encodeURIComponent(frag));
-        return true;
-      }}
-    }}
-    return false;
-  }}
-  // 拦截所有站内锚点链接（href 以 # 开头）点击
-  document.addEventListener('click', function(e) {{
-    const a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (!a) return;
-    const href = a.getAttribute('href') || '';
-    if (href.length < 2 || href.charAt(0) != '#') return;
-    // 原生先让浏览器走一次，如果失败（tryScroll 里仍找不到）再兜底
-    setTimeout(function() {{ tryScrollToHash(href); }}, 0);
-  }});
-  // hashchange 时兜底（浏览器 forward/back 或直接改 URL）
-  window.addEventListener('hashchange', function() {{
-    tryScrollToHash(location.hash);
-  }});
-  // 页面初次加载如果 URL 带 fragment 尝试一下
-  if (location.hash) window.addEventListener('load', function() {{
-    setTimeout(function() {{ tryScrollToHash(location.hash); }}, 50);
-  }});
-}})();
-
-function toggleEditor() {{
-  const form = document.getElementById('editor-form');
-  if (!form) return;
-  const hidden = form.classList.toggle('hidden');
-  const btn = document.getElementById('btn-edit');
-  if (btn) {{
-    if (hidden) {{ btn.textContent = '✎ 编辑'; btn.classList.remove('danger'); btn.classList.add('primary'); }}
-    else {{ btn.textContent = '✕ 取消编辑'; btn.classList.remove('primary'); btn.classList.add('ghost'); }}
-  }}
-  if (!hidden) {{
-    const ta = document.getElementById('md-editor');
-    if (ta) {{ ta.focus(); ta.scrollTop = 0; }}
-  }}
-}}
-/* ---------- Delete Confirm Modal ---------- */
-(function(){{
-  let pendingForm = null;
-  function openModal(label, kind) {{
-    const mask = document.getElementById('delete-modal');
-    if (!mask) return;
-    const labelEl = mask.querySelector('[data-modal-target]');
-    const descEl  = mask.querySelector('[data-modal-desc]');
-    const kindText = kind === 'dir' ? '空目录' : '文件';
-    if (labelEl) labelEl.textContent = label;
-    if (descEl)  descEl.textContent = '您即将删除以下 ' + kindText + '，此操作无法撤销，确定继续吗？';
-    mask.classList.remove('hidden');
-    setTimeout(()=>{{
-      const confirmBtn = mask.querySelector('[data-modal-confirm]');
-      if (confirmBtn) confirmBtn.focus();
-    }}, 0);
-  }}
-  function closeModal() {{
-    const mask = document.getElementById('delete-modal');
-    if (mask) mask.classList.add('hidden');
-    pendingForm = null;
-  }}
-  function submitModal() {{
-    if (pendingForm) {{
-      // 后端二次确认校验：附带 _confirm=1 隐藏字段
-      try {{
-        let tag = pendingForm.querySelector('input[name="_confirm"]');
-        if (!tag) {{
-          tag = document.createElement('input');
-          tag.type = 'hidden';
-          tag.name = '_confirm';
-          pendingForm.appendChild(tag);
-        }}
-        tag.value = '1';
-      }} catch(_) {{}}
-      pendingForm.submit();
-      pendingForm = null;
-    }}
-    closeModal();
-  }}
-  // Public API (delete-btn 通过 onclick 调用：confirmDelete(this, label, kind))
-  window.confirmDelete = function(btn, label, kind) {{
-    const form = btn.closest('form');
-    if (!form) return;
-    pendingForm = form;
-    openModal(label || '未命名', kind || 'file');
-  }};
-  // 页面加载后绑定全局（遮罩点击取消 / Esc 取消 / 按钮事件）
-  document.addEventListener('DOMContentLoaded', function() {{
-    const mask = document.getElementById('delete-modal');
-    if (!mask) return;
-    mask.addEventListener('click', function(e) {{
-      if (e.target === mask) closeModal();
-    }});
-    const cancelBtn  = mask.querySelector('[data-modal-cancel]');
-    const confirmBtn = mask.querySelector('[data-modal-confirm]');
-    if (cancelBtn)  cancelBtn.addEventListener('click', closeModal);
-    if (confirmBtn) confirmBtn.addEventListener('click', submitModal);
-    document.addEventListener('keydown', function(e) {{
-      if (e.key === 'Escape' && !mask.classList.contains('hidden')) closeModal();
-    }});
-  }});
-}})();
-</script>
-</head>
-<body>
-<div class="shell">
-  <header class="site-header">
-    <h1><span class="logo">📖</span>{title}</h1>
-    <div class="breadcrumb">{breadcrumb}</div>
-  </header>
-  <div class="md-body">
-    {body}
-  </div>
-</div>
-
-<!-- 全局删除确认弹窗 -->
-<div id="delete-modal" class="modal-mask hidden" role="dialog" aria-modal="true" aria-labelledby="del-title">
-  <div class="modal-card">
-    <div class="modal-head">
-      <div class="modal-icon" aria-hidden="true">⚠</div>
-      <div style="flex:1;min-width:0">
-        <h3 class="modal-title" id="del-title">确认删除</h3>
-        <p class="modal-desc" data-modal-desc>您即将删除以下内容，此操作无法撤销，确定继续吗？</p>
-        <span class="modal-target" data-modal-target>—</span>
-      </div>
-    </div>
-    <div class="modal-foot">
-      <button type="button" class="ghost" data-modal-cancel>取消</button>
-      <button type="button" class="danger" data-modal-confirm>🗑 确认删除</button>
-    </div>
-  </div>
-</div>
-
-</body>
-</html>"#,
-        title = title,
-        breadcrumb = breadcrumb,
-        body = body,
-    )
+    PAGE_TEMPLATE
+        .replace("{TITLE}", title)
+        .replace("{BREADCRUMB}", breadcrumb)
+        .replace("{CSS}", STYLE_CSS)
+        .replace("{SCRIPT}", APP_JS)
+        .replace("{BODY}", body)
 }

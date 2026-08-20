@@ -1,42 +1,44 @@
-# mdview — Rust Markdown 浏览器
+# mdview — Rust 文件浏览器
 
-一个用 Rust 编写的本地 Markdown 文件浏览器。启动后读取指定目录下的 `.md` 文件，通过网页浏览和渲染。
+一个用 Rust 编写的本地文件浏览器。启动后读取指定目录下的 Markdown、图片、文本与代码文件，通过网页浏览、渲染和查看。
 
 ## 功能特性
 
-- 📂 **目录浏览** — 递归列出根目录下所有 `.md` 文件及子目录
-- 🎨 **HTML 渲染** — 将 Markdown 渲染为美观的 GitHub 风格页面
+- 📂 **目录浏览** — 递归列出根目录下所有可查看文件及子目录
+- 📄 **Markdown 渲染** — 将 Markdown 渲染为美观的 GitHub 风格页面，支持表格、删除线、任务列表、标题属性
+- 🖼 **图片查看** — 在线预览 png / jpg / gif / svg / webp / bmp / avif 等图片，并显示尺寸与大小
+- 💻 **代码查看** — 语法高亮查看 C、C++、Java、Python、Rust、JS、TS、CSS、HTML、Go、Kotlin 等主流语言（带行号）
+- 📝 **文本查看** — txt / log / ini / json / yaml 等配置文件与日志
 - 🧭 **面包屑导航** — 显示当前路径，支持点击跳转
 - 📋 **原始文本查看** — 一键查看 Markdown 源码
 - 🔒 **安全防护** — 路径规范化校验，阻止 `../` 目录遍历攻击
 - ⚙️ **命令行配置** — 自定义浏览目录与监听地址
-- ✨ **Markdown 扩展语法** — 表格、删除线、任务列表、标题属性
 
 ## 快速开始
 
 ```bash
-# 克隆/进入项目
-cd /home/yy/aaa/mdview
+# 进入项目
+cd /Users/yy/pro-test/mdview
 
-# 运行（默认浏览 ./docs 目录）
-cargo run
+# 浏览指定目录
+cargo run -- --dir ./docs
 
 # 自定义目录与端口
-cargo run -- --dir /path/to/md/folder --addr 0.0.0.0:8080
+cargo run -- --dir /path/to/folder --addr 0.0.0.0:8080
 
 # 发布构建
 cargo build --release
 ./target/release/mdview --dir /path/to/docs
 ```
 
-启动后访问 `http://127.0.0.1:3000` 即可。
+启动后访问 `http://127.0.0.1:9880` 即可。
 
 ## 命令行参数
 
 | 参数 | 短选项 | 默认值 | 说明 |
 |------|--------|--------|------|
-| `--dir` | `-d` | `./docs` | 要浏览的 Markdown 文件根目录 |
-| `--addr` | — | `127.0.0.1:3000` | HTTP 服务器监听地址 |
+| `--dir` | `-d` | （必填） | 要浏览的文件根目录 |
+| `--addr` | — | `127.0.0.1:9880` | HTTP 服务器监听地址 |
 
 ```bash
 # 示例
@@ -47,9 +49,10 @@ mdview --dir ~/notes --addr 0.0.0.0:8888
 
 | 路由 | 说明 |
 |------|------|
-| `/` | 根目录索引：列出所有 `.md` 文件与子目录 |
-| `/browse/*path` | 浏览子目录 / 渲染指定 `.md` 文件为 HTML |
+| `/` | 根目录索引：列出所有可查看文件与子目录 |
+| `/browse/*path` | 浏览子目录 / 渲染 `.md` / 预览图片 / 高亮查看代码文本 |
 | `/raw/*path` | 以 `<pre>` 形式展示 Markdown 原始文本 |
+| `/static/*path` | 静态资源服务（图片原文、文件下载等） |
 
 ## 技术栈
 
@@ -58,6 +61,7 @@ mdview --dir ~/notes --addr 0.0.0.0:8888
 | [axum](https://crates.io/crates/axum) | 异步 Web 框架，负责路由与 HTTP 服务 |
 | [tokio](https://crates.io/crates/tokio) | Rust 异步运行时 |
 | [pulldown-cmark](https://crates.io/crates/pulldown-cmark) | Markdown → HTML 解析器（启用表格 / 删除线 / 任务列表 / 标题属性扩展） |
+| [syntect](https://crates.io/crates/syntect) | 服务端代码语法高亮（Sublime Text 语法集，离线可用） |
 | [clap](https://crates.io/crates/clap) | 命令行参数解析 |
 | [urlencoding](https://crates.io/crates/urlencoding) | URL 路径解码 |
 | [anyhow](https://crates.io/crates/anyhow) | 统一错误处理 |
@@ -69,7 +73,11 @@ mdview --dir ~/notes --addr 0.0.0.0:8888
 mdview/
 ├── Cargo.toml           # 项目配置与依赖
 ├── src/
-│   └── main.rs          # 入口：路由、目录遍历、Markdown 渲染
+│   ├── main.rs              # 入口：路由、目录遍历、Markdown 渲染、代码高亮
+│   └── templates/           # 编译期嵌入（include_str!）的前端资源
+│       ├── page.html        # 页面 HTML 骨架（含 {CSS}/{SCRIPT} 占位符）
+│       ├── style.css         # 全部样式
+│       └── app.js            # 回到顶部 / 锚点模糊匹配 / 删除确认弹窗
 ├── docs/
 │   └── hello.md         # 示例文档
 └── README.md

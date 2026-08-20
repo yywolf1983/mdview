@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{TITLE}</title>
+<style>
+{CSS}
+</style>
+<script>
+{SCRIPT}
+</script>
+</head>
+<body>
+<div class="shell">
+  <header class="site-header">
+    <h1><span class="logo">📖</span>{TITLE}</h1>
+    <div class="breadcrumb">{BREADCRUMB}</div>
+  </header>
+  <div class="md-body">
+    {BODY}
+  </div>
+</div>
+
+<!-- 全局删除确认弹窗 -->
+<div id="delete-modal" class="modal-mask hidden" role="dialog" aria-modal="true" aria-labelledby="del-title">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-icon" aria-hidden="true">⚠</div>
+      <div style="flex:1;min-width:0">
+        <h3 class="modal-title" id="del-title">确认删除</h3>
+        <p class="modal-desc" data-modal-desc>您即将删除以下内容，此操作无法撤销，确定继续吗？</p>
+        <span class="modal-target" data-modal-target>—</span>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="ghost" data-modal-cancel>取消</button>
+      <button type="button" class="danger" data-modal-confirm>🗑 确认删除</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
