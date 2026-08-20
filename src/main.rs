@@ -36,6 +36,8 @@ struct FileItem {
     name: String,
     path: String, // 相对根目录的路径（使用 /）
     is_dir: bool,
+    #[serde(skip)]
+    mtime: Option<std::time::SystemTime>, // 用于"最新修改在前"排序（不传到前端）
 }
 
 /// 新建文件 / 目录的表单
@@ -443,17 +445,28 @@ fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
         if is_dir || is_md {
             let rel = path.strip_prefix(root).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let mtime = entry.metadata().ok().and_then(|md| md.modified().ok());
             items.push(FileItem {
                 name,
                 path: rel_str,
                 is_dir,
+                mtime,
             });
         }
     }
     items.sort_by(|a, b| {
         b.is_dir
-            .cmp(&a.is_dir) // 目录在前
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .cmp(&a.is_dir) // 目录永远在前
+            .then_with(|| {
+                // 目录内部 / 文件内部：最新修改时间排在最前
+                match (a.mtime, b.mtime) {
+                    (Some(ta), Some(tb)) => tb.cmp(&ta), // 倒序（新→旧）
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())) // 同时间兜底按名称
     });
     Ok(items)
 }
