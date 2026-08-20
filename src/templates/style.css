@@ -524,7 +524,9 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   border-color: var(--border-strong);
   box-shadow: var(--shadow);
   display: grid;            /* 高亮层与 textarea 重叠于同一单元格，cell 高度由内容撑开 */
-  max-height: 78vh;        /* 仅编辑态限制窗口高度，查看态铺满整页随页面滚动 */
+  align-content: start;     /* 行从顶部排布，高度完全由内容决定，杜绝被容器拉伸/压缩 */
+  height: 80vh;            /* 编辑窗口固定高度，内容超出时内部滚动，不随内容增高 */
+  background: #ffffff;     /* 编辑窗口纯白背景 */
 }
 .editor-body:focus-within {
   border-color: #8b5cf6;
@@ -560,7 +562,7 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   pointer-events: none;
 }
 .editor-highlight .cur-line {
-  background: rgba(139, 92, 246, .07);
+  background: rgba(139, 92, 246, .10);
 }
 /* 编辑态高亮层：位于文档流中，自然撑开容器高度（文字由 JS 实时着色，仅作视觉背景）。
    关键：显式继承字体并关闭连字，否则 <pre>/<code> 的 UA 默认 monospace 与
@@ -577,6 +579,12 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   color: #0f172a;
   pointer-events: none;
   z-index: 1;
+  height: max-content;      /* CSS 兜底：高亮层高度=内容高（JS 会再按 scrollHeight 精确同步） */
+  box-sizing: border-box;
+  background: transparent;  /* 编辑窗口纯白：背景完全由 .editor-body 提供，pre 不留任何底色 */
+  border: 0;                /* 去掉全局 pre 样式的边框/圆角/阴影，避免出现双重边框 */
+  border-radius: 0;
+  box-shadow: none;
 }
 .editor-highlight code {
   background: transparent;
@@ -862,7 +870,8 @@ pre::-webkit-scrollbar-thumb:hover { background: #b9c2cf; background-clip: paddi
 
 /* 移动端：编辑器/代码区字号略缩，行号列收窄 */
 @media (max-width: 640px) {
-  .editor-body, .code-view { font-size: .82em; max-height: 70vh; }
+  .editor-body, .code-view { font-size: .82em; }
+  .editor-body { height: 55vh; }
   .editor-gutter, .code-gutter { width: 2.8em; padding-right: 8px; }
   .editor-highlight, .code-body, .editor-body #md-editor { padding: 12px 14px; }
   .code-view-title { font-size: .78em; }

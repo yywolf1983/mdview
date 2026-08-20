@@ -228,6 +228,9 @@ function highlightEditor(ta) {
     var pos = ta.selectionStart, cur = ta.value.slice(0, pos).split('\n').length - 1;
     var cls = pre.querySelectorAll('.cl');
     for (var i = 0; i < cls.length; i++) cls[i].classList.toggle('cur-line', i === cur);
+    // 强制高亮层高度 = textarea 内容总高（scrollHeight 含上下 padding），
+    // 保证 grid 行高被内容撑开、.editor-body 一定有滚动条（滚动由容器驱动，textarea 自身不滚）
+    pre.style.height = ta.scrollHeight + 'px';
   }
   // 光标滚入可视区（容器统一滚动，textarea 自身不滚）
   var body = ta.closest('.editor-body');
@@ -412,4 +415,31 @@ document.addEventListener('keydown', function(e) {
       if (e.key === 'Escape' && !mask.classList.contains('hidden')) closeRenameModal();
     });
   });
+})();
+/* ---------- Editor scroll takeover ----------
+   编辑框内滚轮 → 编辑框内部滚动条滚动；
+   编辑框外 / 编辑框滚到边界 → 交回页面外部滚动条。
+   textarea overflow:hidden 会拦截 wheel 默认滚动，故手动转交。 */
+(function(){
+  var body = null;
+  function editorBody() {
+    if (body && document.body.contains(body)) return body;
+    var ta = document.getElementById('md-editor');
+    body = ta ? ta.closest('.editor-body') : null;
+    return body;
+  }
+  document.addEventListener('wheel', function(e) {
+    var b = editorBody();
+    if (!b) return;
+    // 鼠标不在编辑框内：不接管，页面正常滚动
+    if (e.target !== b && !b.contains(e.target)) return;
+    // 编辑框内容未超出可视区：无需内部滚动，交还页面
+    if (b.scrollHeight <= b.clientHeight + 1) return;
+    // 行模式(deltaMode=1)换算为像素（每行约 20px）
+    var step = (e.deltaMode === 1) ? e.deltaY * 20 : e.deltaY;
+    var before = b.scrollTop;
+    b.scrollTop += step;
+    // 只有内部滚动条真正移动了才阻止默认（否则到边界时放行，链式滚动页面）
+    if (b.scrollTop !== before) e.preventDefault();
+  }, { passive: false });
 })();
