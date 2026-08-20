@@ -91,9 +91,44 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = TcpListener::bind(&args.addr).await?;
+
+    // 用系统默认浏览器打开一个新标签页访问应用
+    let url = if let Some((host, port)) = args.addr.rsplit_once(':') {
+        if host == "0.0.0.0" || host == "::" || host == "[::]" {
+            format!("http://127.0.0.1:{port}") // 0.0.0.0 不能直接访问，改用回环地址
+        } else {
+            format!("http://{}", args.addr)
+        }
+    } else {
+        format!("http://{}", args.addr)
+    };
+    println!("   打开: {url}");
+    open_browser(&url);
+
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// 调用系统默认浏览器打开 URL（后台执行，不阻塞服务器启动）
+fn open_browser(url: &str) {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let res = match std::env::consts::OS {
+            "macos" => std::process::Command::new("open").arg(&url).spawn(),
+            "linux" => std::process::Command::new("xdg-open").arg(&url).spawn(),
+            "windows" => std::process::Command::new("cmd")
+                .args(["/C", "start", "", &url])
+                .spawn(),
+            other => {
+                eprintln!("暂不支持在 {other} 上自动打开浏览器");
+                return;
+            }
+        };
+        if let Err(e) = res {
+            eprintln!("打开浏览器失败: {e}");
+        }
+    });
 }
 
 /// 首页：列出根目录下的所有 markdown 文件
@@ -717,7 +752,7 @@ fn md_toolbar(rel_path: &str, raw_content: &str) -> String {
     </div>
     <div class="editor-body">
       <pre class="editor-highlight" aria-hidden="true"><code>{highlight}</code></pre>
-      <textarea name="content" id="md-editor" spellcheck="false">{content}</textarea>
+      <textarea name="content" id="md-editor" spellcheck="false" data-plain="1">{content}</textarea>
     </div>
   </form>
 </div>"#,

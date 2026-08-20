@@ -217,13 +217,24 @@ function highlightCodeText(src) {
   return out;
 }
 
+// MD 文件编辑：纯深黑文本镜像（每行包 .cl 保持行号与选中行高亮），不做语法着色
+function plainTextHtml(src) {
+  var out = '', lines = src.split('\n'), i;
+  for (i = 0; i < lines.length; i++) {
+    out += '<div class="cl">' + escHtml(lines[i]) + '</div>';
+  }
+  return out;
+}
+
 function highlightEditor(ta) {
   var form = ta.closest('.editor-form');
   if (!form) return;
   var pre = form.querySelector('.editor-highlight');
   if (pre) {
     var code = pre.querySelector('code');
-    if (code) code.innerHTML = highlightCodeText(ta.value);
+    if (code) code.innerHTML = ta.hasAttribute('data-plain')
+      ? plainTextHtml(ta.value)
+      : highlightCodeText(ta.value);
     // 当前行高亮（行号由 CSS 计数器统一生成，无需单独维护列）
     var pos = ta.selectionStart, cur = ta.value.slice(0, pos).split('\n').length - 1;
     var cls = pre.querySelectorAll('.cl');

@@ -527,6 +527,14 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   align-content: start;     /* 行从顶部排布，高度完全由内容决定，杜绝被容器拉伸/压缩 */
   height: 80vh;            /* 编辑窗口固定高度，内容超出时内部滚动，不随内容增高 */
   background: #ffffff;     /* 编辑窗口纯白背景 */
+  /* 75 字符红线（Vim colorcolumn 风格，固定不随文本滚动）：
+     background 相对编辑框固定（默认 attachment:scroll），文本在线上方滚动，
+     线始终停在第 75 列（行号区 + 内边距 + 75ch）的位置 */
+  background-image: linear-gradient(to right,
+    transparent calc(var(--code-pad-x) + var(--ln-w) + var(--ln-pad) + 75ch),
+    #ef4444 calc(var(--code-pad-x) + var(--ln-w) + var(--ln-pad) + 75ch),
+    #ef4444 calc(var(--code-pad-x) + var(--ln-w) + var(--ln-pad) + 75ch + 1px),
+    transparent calc(var(--code-pad-x) + var(--ln-w) + var(--ln-pad) + 75ch + 1px));
 }
 .editor-body:focus-within {
   border-color: #8b5cf6;
@@ -576,7 +584,7 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   font-size: inherit;
   font-variant-ligatures: none;
   letter-spacing: normal;
-  color: #0f172a;
+  color: #111827;
   pointer-events: none;
   z-index: 1;
   height: max-content;      /* CSS 兜底：高亮层高度=内容高（JS 会再按 scrollHeight 精确同步） */
@@ -603,7 +611,7 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   font-variant-ligatures: none;
   letter-spacing: normal;
   overflow: hidden;
-  color: #0f172a;
+  color: #111827;
 }
 .code-body code {
   background: transparent;
