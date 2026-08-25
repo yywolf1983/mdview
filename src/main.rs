@@ -2,13 +2,15 @@ use axum::{
     body::Body,
     extract::{Form, Path, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
 use clap::Parser;
+use hmac::{Hmac, Mac};
 use pulldown_cmark::{Options, Parser as MdParser};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::OnceLock;
@@ -21,18 +23,69 @@ use tokio::net::TcpListener;
 #[derive(Parser, Debug)]
 #[command(name = "mdview", about = "Markdown 文件浏览器")]
 struct Args {
-    /// 要浏览的 Markdown 目录（必填，无默认）
-    #[arg(short, long, required = true)]
-    dir: String,
+    /// 要浏览的目录（可选）。指定后覆盖配置文件中的目录列表
+    #[arg(short, long)]
+    dir: Option<String>,
 
     /// 监听地址（默认 127.0.0.1:9880）
     #[arg(long, default_value = "127.0.0.1:9880")]
     addr: String,
+
+    /// 配置文件路径（必须显式指定，不传则报错退出；不会自动查找或生成）
+    #[arg(long)]
+    config: Option<String>,
+}
+
+// ===================== 配置 =====================
+
+/// 单个可浏览目录配置
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct DirConf {
+    /// 显示名称（下拉切换器里展示）
+    name: String,
+    /// 目录路径（支持相对路径，启动时会 canonicalize）
+    path: String,
+}
+
+/// 完整配置文件结构（mdview.toml）
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ConfigFile {
+    /// 监听地址
+    #[serde(default)]
+    addr: Option<String>,
+    /// 访问密码。留空 = 无需登录直接访问
+    #[serde(default)]
+    password: Option<String>,
+    /// 多个目录
+    #[serde(default)]
+    dirs: Vec<DirConf>,
 }
 
 #[derive(Clone)]
 struct AppState {
+    /// 解析后的多个目录（绝对路径）
+    dirs: Vec<ResolvedDir>,
+    /// 密码（None 或空串 = 无需登录）
+    password: Option<String>,
+    /// 认证 cookie 签名密钥
+    secret: [u8; 32],
+}
+
+/// 已解析（路径规范化后的）目录
+#[derive(Clone)]
+struct ResolvedDir {
+    name: String,
     root: PathBuf,
+}
+
+impl AppState {
+    /// 是否需要登录（配置了非空密码）
+    fn need_auth(&self) -> bool {
+        match &self.password {
+            Some(p) => !p.is_empty(),
+            None => false,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -63,44 +116,186 @@ struct SaveForm {
     content: String,
 }
 
+/// 登录表单
+#[derive(Deserialize, Debug)]
+struct LoginForm {
+    #[serde(default)]
+    password: String,
+}
+
+// ===================== 认证工具 =====================
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// 根据 secret 为密码生成一个签名 token（HMAC）
+fn make_token(secret: &[u8; 32]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC 可初始化");
+    mac.update(b"mdview-auth");
+    let out = mac.finalize().into_bytes();
+    hex_encode(&out)
+}
+
+/// 校验请求 Cookie 中的 auth token 是否有效
+fn cookie_auth_valid(headers: &HeaderMap, state: &AppState) -> bool {
+    let Some(cookie) = headers.get(axum::http::header::COOKIE) else {
+        return false;
+    };
+    let Ok(cookie) = cookie.to_str() else {
+        return false;
+    };
+    let want = make_token(&state.secret);
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("mdview_auth=") {
+            if v == want {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 字节转十六进制（无外部依赖）
+fn hex_encode(bytes: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(H[(b >> 4) as usize] as char);
+        s.push(H[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+// ===================== 配置加载 =====================
+
+/// 加载配置：配置文件必须由 --config 显式指定，不存在则报错
+fn load_config(args: &Args) -> anyhow::Result<ConfigFile> {
+    let cfg_path = match &args.config {
+        Some(p) => PathBuf::from(p),
+        None => anyhow::bail!(
+            "必须通过 --config <路径> 显式指定配置文件（例如：mdview --config mdview.toml）"
+        ),
+    };
+    if !cfg_path.exists() {
+        anyhow::bail!("配置文件不存在: {}", cfg_path.display());
+    }
+    let txt = fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow::anyhow!("读取配置文件 {} 失败: {}", cfg_path.display(), e))?;
+    let mut cfg: ConfigFile = toml::from_str(&txt)
+        .map_err(|e| anyhow::anyhow!("解析配置文件 {} 失败: {}", cfg_path.display(), e))?;
+
+    // 命令行 --dir 优先：覆盖（或追加）目录列表
+    if let Some(d) = &args.dir {
+        cfg.dirs = vec![DirConf {
+            name: "默认目录".to_string(),
+            path: d.clone(),
+        }];
+    }
+
+    // 若没有任何目录配置，回退到当前工作目录
+    if cfg.dirs.is_empty() {
+        cfg.dirs = vec![DirConf {
+            name: "当前目录".to_string(),
+            path: ".".to_string(),
+        }];
+    }
+
+    Ok(cfg)
+}
+
+/// 用系统熵填充字节（getrandom 优先，失败时退化为时间+地址随机）
+fn getrandom_fill(buf: &mut [u8; 32]) {
+    if getrandom::getrandom(buf).is_ok() {
+        return;
+    }
+    // 回退：基于时间与内存地址的伪随机
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (buf.as_ptr() as usize as u64);
+    let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+    for b in buf.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *b = (s & 0xff) as u8;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let root = std::fs::canonicalize(&args.dir)
-        .map_err(|_| anyhow::anyhow!("无法访问目录: {}", args.dir))?;
+    let mut cfg = load_config(&args)?;
 
-    if !root.is_dir() {
-        anyhow::bail!("{} 不是一个目录", root.display());
+    // addr 优先级：命令行 > 配置 > 默认
+    let addr = if args.addr != "127.0.0.1:9880" {
+        args.addr.clone()
+    } else {
+        cfg.addr.clone().unwrap_or_else(|| "127.0.0.1:9880".to_string())
+    };
+
+    // 解析各目录为绝对路径
+    let mut dirs = Vec::new();
+    for d in &cfg.dirs {
+        let p = std::fs::canonicalize(&d.path)
+            .map_err(|_| anyhow::anyhow!("无法访问目录: {}", d.path))?;
+        if !p.is_dir() {
+            anyhow::bail!("{} 不是一个目录", p.display());
+        }
+        dirs.push(ResolvedDir {
+            name: d.name.clone(),
+            root: p,
+        });
     }
 
-    println!("📖 文件浏览器（Markdown / 图片 / 代码）");
-    println!("   目录: {}", root.display());
-    println!("   地址: http://{}", args.addr);
+    let password = cfg.password.take().filter(|p| !p.is_empty());
 
-    let state = AppState { root: root.clone() };
+    // 生成随机签名密钥
+    let secret = {
+        let mut buf = [0u8; 32];
+        getrandom_fill(&mut buf);
+        buf
+    };
+
+    println!("📖 文件浏览器（Markdown / 图片 / 代码）");
+    for (i, d) in dirs.iter().enumerate() {
+        println!("   [{}] {} -> {}", i, d.name, d.root.display());
+    }
+    if password.is_some() {
+        println!("🔒 已启用密码保护");
+    } else {
+        println!("🔓 未设置密码，可直接访问");
+    }
+    println!("   地址: http://{}", addr);
+
+    let state = AppState { dirs, password, secret };
 
     let app = Router::new()
         .route("/", get(index))
         .route("/browse/*path", get(browse))
         .route("/raw/*path", get(raw_view))
         .route("/static/*path", get(static_file))
+        .route("/login", get(login_page))
+        .route("/login", post(login_post))
+        .route("/logout", get(logout))
         .route("/api/save/*path", post(save_file))
         .route("/api/new", post(new_entry))
         .route("/api/delete/*path", post(delete_entry))
         .route("/api/rename/*path", post(rename_entry))
         .with_state(state);
 
-    let listener = TcpListener::bind(&args.addr).await?;
+    let listener = TcpListener::bind(&addr).await?;
 
     // 用系统默认浏览器打开一个新标签页访问应用
-    let url = if let Some((host, port)) = args.addr.rsplit_once(':') {
+    let url = if let Some((host, port)) = addr.rsplit_once(':') {
         if host == "0.0.0.0" || host == "::" || host == "[::]" {
             format!("http://127.0.0.1:{port}") // 0.0.0.0 不能直接访问，改用回环地址
         } else {
-            format!("http://{}", args.addr)
+            format!("http://{}", addr)
         }
     } else {
-        format!("http://{}", args.addr)
+        format!("http://{}", addr)
     };
     println!("   打开: {url}");
     open_browser(&url);
@@ -132,31 +327,46 @@ fn open_browser(url: &str) {
 }
 
 /// 首页：列出根目录下的所有 markdown 文件
-async fn index(State(state): State<AppState>) -> Html<String> {
-    let files = list_files(&state.root, &state.root).unwrap_or_default();
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, Redirect> {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Err(Redirect::to("/login"));
+    }
+    let root = active_root(&headers, &state);
+    let files = list_files(&root, &root).unwrap_or_default();
+    let switcher = dir_switcher_html(&state, &headers);
     let body = new_entry_form("") + &file_list_html(&files, true, "");
-    let html = render_page("Markdown 浏览器", "", &body);
-    Html(html)
+    let html = render_page("Markdown 浏览器", "", &switcher, &body);
+    Ok(Html(html))
 }
 
 /// 浏览：列出指定子目录 / 渲染指定 md 文件
 async fn browse(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
-) -> Result<Html<String>, (StatusCode, String)> {
-    let target = resolve_path(&state.root, &subpath);
+) -> Result<Response, (StatusCode, String)> {
+    let root = active_root(&headers, &state);
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let target = resolve_path(&root, &subpath);
 
     if target.is_dir() {
-        let files = list_files(&state.root, &target).unwrap_or_default();
-        let rel_dir = display_rel(&state.root, &target);
+        let files = list_files(&root, &target).unwrap_or_default();
+        let rel_dir = display_rel(&root, &target);
         let title = format!("目录 /{}", rel_dir);
+        let switcher = dir_switcher_html(&state, &headers);
         let body = new_entry_form(&rel_dir) + &file_list_html(&files, false, &rel_dir);
         let html = render_page(
             &title,
-            &breadcrumb(&state.root, &target),
+            &breadcrumb(&root, &target),
+            &switcher,
             &body,
         );
-        return Ok(Html(html));
+        return Ok(Html(html).into_response());
     }
 
     let ext = target
@@ -169,7 +379,7 @@ async fn browse(
         .and_then(|s| s.to_str())
         .unwrap_or("untitled")
         .to_string();
-    let rel_path = display_rel(&state.root, &target);
+    let rel_path = display_rel(&root, &target);
 
     if target.is_file() && ext == "md" {
         match fs::read_to_string(&target) {
@@ -179,8 +389,8 @@ async fn browse(
                 let rel_dir = target
                     .parent()
                     .map(|p| {
-                        p.strip_prefix(&state.root)
-                            .unwrap_or(&state.root)
+                        p.strip_prefix(&root)
+                            .unwrap_or(&root)
                             .to_string_lossy()
                             .replace('\\', "/")
                     })
@@ -193,9 +403,10 @@ async fn browse(
                     .unwrap_or("untitled")
                     .to_string();
                 let toolbar = md_toolbar(&rel_path, &raw_content);
+                let switcher = dir_switcher_html(&state, &headers);
                 let body = toolbar + "<div class=\"card\">" + &md_html + "</div>";
-                let html = render_page(&title, &breadcrumb(&state.root, &target), &body);
-                return Ok(Html(html));
+                let html = render_page(&title, &breadcrumb(&root, &target), &switcher, &body);
+                return Ok(Html(html).into_response());
             }
             Err(e) => {
                 return Err((
@@ -213,21 +424,21 @@ async fn browse(
                 format!("读取文件失败: {e}"),
             )
         })?;
-        let crumb = breadcrumb(&state.root, &target);
+        let crumb = breadcrumb(&root, &target);
         if is_image_ext(&ext) {
             // 图片文件：直接预览
             let body = image_view_html(&rel_path, &name, &raw, &ext);
-            return Ok(Html(render_page(&format!("🖼 {name}"), &crumb, &body)));
+            return Ok(Html(render_page(&format!("🖼 {name}"), &crumb, "", &body)).into_response());
         }
         if is_text_viewable(&target) {
             // 文本 / 代码文件：语法高亮查看
             let content = String::from_utf8_lossy(&raw);
             let body = code_view_html(&rel_path, &name, &content, &raw);
-            return Ok(Html(render_page(&name, &crumb, &body)));
+            return Ok(Html(render_page(&name, &crumb, "", &body)).into_response());
         }
         // 其他文件：显示不支持预览的提示（仅保留删除）
         let body = unsupported_view_html(&rel_path, &name, &raw, &ext);
-        return Ok(Html(render_page(&name, &crumb, &body)));
+        return Ok(Html(render_page(&name, &crumb, "", &body)).into_response());
     }
 
     Err((StatusCode::NOT_FOUND, "未找到该文件或目录".into()))
@@ -236,9 +447,14 @@ async fn browse(
 /// 原始 Markdown 查看
 async fn raw_view(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
-) -> Result<Html<String>, (StatusCode, String)> {
-    let target = resolve_path(&state.root, &subpath);
+) -> Result<Response, (StatusCode, String)> {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let root = active_root(&headers, &state);
+    let target = resolve_path(&root, &subpath);
     if target.is_file() && target.extension().and_then(|e| e.to_str()) == Some("md") {
         match fs::read_to_string(&target) {
             Ok(content) => {
@@ -248,11 +464,11 @@ async fn raw_view(
                     .replace('>', "&gt;");
                 let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 // 构造返回链接（回到浏览页）
-                let rel = target.strip_prefix(&state.root).unwrap_or(&target);
+                let rel = target.strip_prefix(&root).unwrap_or(&target);
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
                 let back_url = format!("/browse/{}", url_encode_path(&rel_str));
                 // 带面包屑 + 工具栏 + 卡片样式
-                let crumb = breadcrumb(&state.root, &target);
+                let crumb = breadcrumb(&root, &target);
                 let body = format!(
                     r#"<div class="card">
   <div class="md-toolbar">
@@ -269,7 +485,7 @@ async fn raw_view(
                     name = name.replace('&', "&amp;").replace('<', "&lt;"),
                     escaped = escaped,
                 );
-                return Ok(Html(render_page(&format!("原始内容 · {}", name), &crumb, &body)));
+                return Ok(Html(render_page(&format!("原始内容 · {}", name), &crumb, "", &body)).into_response());
             }
             Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
         }
@@ -280,9 +496,14 @@ async fn raw_view(
 /// 静态资源文件服务（用于 Markdown 中引用的图片/附件等）
 async fn static_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
-    let target = resolve_path(&state.root, &subpath);
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let root = active_root(&headers, &state);
+    let target = resolve_path(&root, &subpath);
     if target.is_file() {
         match fs::read(&target) {
             Ok(bytes) => {
@@ -306,30 +527,35 @@ async fn static_file(
 /// 保存 Markdown 文件（用于编辑 / 新建已命名的 md）
 async fn save_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
     Form(form): Form<SaveForm>,
 ) -> Result<Redirect, (StatusCode, String)> {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "需要登录".into()));
+    }
+    let root = active_root(&headers, &state);
     // 父目录必须存在；若 subpath 指向仍不存在的文件，resolve_path 会回退到 root，所以这里手动拼接
     let decoded = urlencoding::decode(&subpath)
         .unwrap_or_else(|_| std::borrow::Cow::Borrowed(&subpath))
         .to_string();
-    let target = state.root.join(&decoded);
+    let target = root.join(&decoded);
     // 再次校验越权：父目录必须在 root 下
-    let parent = target.parent().unwrap_or(&state.root).to_path_buf();
+    let parent = target.parent().unwrap_or(&root).to_path_buf();
     let parent_canon = fs::canonicalize(&parent).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("父目录不存在: {}", e),
         )
     })?;
-    if !parent_canon.starts_with(&state.root) {
+    if !parent_canon.starts_with(&root) {
         return Err((StatusCode::FORBIDDEN, "越权保存".into()));
     }
     // 如果目标文件存在，检查规范路径
     if target.exists() {
         let canon = fs::canonicalize(&target)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-        if !canon.starts_with(&state.root) {
+        if !canon.starts_with(&root) {
             return Err((StatusCode::FORBIDDEN, "越权保存".into()));
         }
     }
@@ -340,7 +566,7 @@ async fn save_file(
         )
     })?;
     // 回到浏览页
-    let rel = target.strip_prefix(&state.root).unwrap_or(&target);
+    let rel = target.strip_prefix(&root).unwrap_or(&target);
     Ok(Redirect::to(&format!(
         "/browse/{}",
         url_encode_path(&rel.to_string_lossy().replace('\\', "/"))
@@ -350,8 +576,13 @@ async fn save_file(
 /// 新建文件 / 目录（同名不覆盖）
 async fn new_entry(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<NewForm>,
 ) -> Result<Redirect, (StatusCode, String)> {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "需要登录".into()));
+    }
+    let root = active_root(&headers, &state);
     let name = form.name.trim().to_string();
     if name.is_empty() || name.starts_with('.') {
         return Err((StatusCode::BAD_REQUEST, "名称不能为空或隐藏文件".into()));
@@ -361,16 +592,16 @@ async fn new_entry(
         return Err((StatusCode::BAD_REQUEST, "名称包含非法字符".into()));
     }
     let parent_canon = if form.parent.is_empty() {
-        state.root.clone()
+        root.clone()
     } else {
-        let p = resolve_path(&state.root, &form.parent);
+        let p = resolve_path(&root, &form.parent);
         if !p.is_dir() {
             return Err((StatusCode::BAD_REQUEST, "父目录无效".into()));
         }
         p
     };
     // 确保父目录真实在 root 下
-    if !parent_canon.starts_with(&state.root) {
+    if !parent_canon.starts_with(&root) {
         return Err((StatusCode::FORBIDDEN, "越权新建".into()));
     }
     if form.is_dir {
@@ -400,7 +631,7 @@ async fn new_entry(
         })?;
     }
     // 返回父目录浏览页
-    let rel = parent_canon.strip_prefix(&state.root).unwrap_or(&state.root);
+    let rel = parent_canon.strip_prefix(&root).unwrap_or(&root);
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     let url = if rel_str.is_empty() {
         "/".into()
@@ -419,9 +650,14 @@ struct DeleteFormBody {
 
 async fn delete_entry(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
     Form(form): Form<DeleteFormBody>,
 ) -> Result<Redirect, (StatusCode, String)> {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "需要登录".into()));
+    }
+    let root = active_root(&headers, &state);
     // 二次确认：只有通过前端确认弹窗真正提交的请求才会带 _confirm=1
     let confirmed = form.confirm.as_deref() == Some("1");
     if !confirmed {
@@ -430,17 +666,17 @@ async fn delete_entry(
             "请在确认弹窗中点击「确认删除」后再执行删除操作".into(),
         ));
     }
-    let target = resolve_path(&state.root, &subpath);
-    if target == state.root {
+    let target = resolve_path(&root, &subpath);
+    if target == root {
         return Err((StatusCode::BAD_REQUEST, "不能删除根目录".into()));
     }
-    if !target.starts_with(&state.root) {
+    if !target.starts_with(&root) {
         return Err((StatusCode::FORBIDDEN, "越权删除".into()));
     }
     if !target.exists() {
         return Err((StatusCode::NOT_FOUND, "目标不存在".into()));
     }
-    let parent = target.parent().unwrap_or(&state.root).to_path_buf();
+    let parent = target.parent().unwrap_or(&root).to_path_buf();
     if target.is_dir() {
         // 仅允许空目录
         match fs::read_dir(&target) {
@@ -466,7 +702,7 @@ async fn delete_entry(
         })?;
     }
     // 回跳到父目录
-    let rel = parent.strip_prefix(&state.root).unwrap_or(&state.root);
+    let rel = parent.strip_prefix(&root).unwrap_or(&root);
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     let url = if rel_str.is_empty() {
         "/".into()
@@ -485,14 +721,19 @@ struct RenameForm {
 
 async fn rename_entry(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(subpath): Path<String>,
     Form(form): Form<RenameForm>,
 ) -> Result<Redirect, (StatusCode, String)> {
-    let target = resolve_path(&state.root, &subpath);
-    if target == state.root {
+    if state.need_auth() && !cookie_auth_valid(&headers, &state) {
+        return Err((StatusCode::UNAUTHORIZED, "需要登录".into()));
+    }
+    let root = active_root(&headers, &state);
+    let target = resolve_path(&root, &subpath);
+    if target == root {
         return Err((StatusCode::BAD_REQUEST, "不能重命名根目录".into()));
     }
-    if !target.starts_with(&state.root) {
+    if !target.starts_with(&root) {
         return Err((StatusCode::FORBIDDEN, "越权重命名".into()));
     }
     if !target.exists() {
@@ -505,11 +746,11 @@ async fn rename_entry(
     if new_name.contains('/') || new_name.contains('\\') {
         return Err((StatusCode::BAD_REQUEST, "名称包含非法字符".into()));
     }
-    let parent = target.parent().unwrap_or(&state.root).to_path_buf();
+    let parent = target.parent().unwrap_or(&root).to_path_buf();
     let dest = parent.join(&new_name);
     // 同名直接跳过（无需移动）
     if dest == target {
-        let rel = parent.strip_prefix(&state.root).unwrap_or(&state.root);
+        let rel = parent.strip_prefix(&root).unwrap_or(&root);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let url = if rel_str.is_empty() {
             "/".into()
@@ -528,7 +769,7 @@ async fn rename_entry(
         )
     })?;
     // 回跳到父目录
-    let rel = parent.strip_prefix(&state.root).unwrap_or(&state.root);
+    let rel = parent.strip_prefix(&root).unwrap_or(&root);
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     let url = if rel_str.is_empty() {
         "/".into()
@@ -538,7 +779,129 @@ async fn rename_entry(
     Ok(Redirect::to(&url))
 }
 
-/// 解析路径，防止目录遍历攻击
+// ===================== 登录 / 登出 / 切换目录 =====================
+
+/// 登录页（GET）
+async fn login_page() -> Html<String> {
+    let body = r#"<div class="card login-card">
+  <h2 style="margin-bottom:.6em">🔒 需要访问密码</h2>
+  <form method="post" action="/login" class="login-form">
+    <input type="password" name="password" placeholder="请输入密码" autocomplete="off" autofocus>
+    <button type="submit" class="primary">进入</button>
+    <p class="login-err" data-login-err>密码错误，请重试</p>
+  </form>
+  <script>
+    if (new URLSearchParams(location.search).get('err')) {
+      const el = document.querySelector('[data-login-err]');
+      if (el) el.classList.remove('hidden');
+    }
+  </script>
+</div>"#;
+    Html(render_page("访问受限", "", "", body))
+}
+
+/// 登录提交（POST）
+async fn login_post(
+    State(state): State<AppState>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    // 无密码配置时直接放行
+    if !state.need_auth() {
+        return Redirect::to("/").into_response();
+    }
+    let ok = match &state.password {
+        Some(p) => p == &form.password,
+        None => true,
+    };
+    if !ok {
+        // 返回登录页并附带错误提示参数
+        return Redirect::to("/login?err=1").into_response();
+    }
+    let token = make_token(&state.secret);
+    let cookie = format!(
+        "mdview_auth={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
+        token
+    );
+    let mut resp = Redirect::to("/").into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    resp
+}
+
+/// 登出（GET）
+async fn logout() -> Response {
+    let cookie = "mdview_auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax";
+    let mut resp = Redirect::to("/login").into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    resp
+}
+
+/// 目录切换器 HTML
+/// - 配置了多个目录：显示下拉框（前端直接写 Cookie 后刷新）
+/// - 仅 1 个目录：显示当前目录名 + 提示（方便排查“为什么不能切换”）
+fn dir_switcher_html(state: &AppState, headers: &HeaderMap) -> String {
+    if state.dirs.len() <= 1 {
+        let name = state
+            .dirs
+            .first()
+            .map(|d| d.name.as_str())
+            .unwrap_or("（无）");
+        return format!(
+            r#"<div class="dir-switch dir-switch-single">
+  <label>📁</label>
+  <span class="dir-single-name">{name}</span>
+  <span class="dir-single-hint">（仅配置 1 个目录，无法切换）</span>
+</div>"#
+        );
+    }
+    let cur = selected_index(headers, state);
+    let mut btns = String::new();
+    for (i, d) in state.dirs.iter().enumerate() {
+        let active = if i == cur { " active" } else { "" };
+        btns.push_str(&format!(
+            "<button type=\"button\" class=\"dir-tab{}\" data-idx=\"{}\" onclick=\"document.cookie='mdview_dir={}; Path=/; Max-Age=86400; SameSite=Lax'; location.reload();\">{}</button>",
+            active, i, i, d.name
+        ));
+    }
+    format!(
+        r#"<div class="dir-switch">
+  <span class="dir-switch-label">📁</span>
+  <div class="dir-tabs">{btns}</div>
+</div>"#
+    )
+}
+
+/// 从 Cookie 中读取当前选中的目录索引（越界/无效则回退到 0）
+fn selected_index(headers: &HeaderMap, state: &AppState) -> usize {
+    if state.dirs.len() <= 1 {
+        return 0;
+    }
+    let Some(cookie) = headers.get(axum::http::header::COOKIE) else {
+        return 0;
+    };
+    let Ok(cookie) = cookie.to_str() else {
+        return 0;
+    };
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("mdview_dir=") {
+            if let Ok(i) = v.parse::<usize>() {
+                if i < state.dirs.len() {
+                    return i;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// 根据请求 Cookie 取出当前正在浏览的根目录
+fn active_root(headers: &HeaderMap, state: &AppState) -> PathBuf {
+    state.dirs[selected_index(headers, state)].root.clone()
+}
+
+/// 解析路径，防止目录遍历攻击。root 为当前选中的目录根。
 fn resolve_path(root: &FsPath, subpath: &str) -> PathBuf {
     let decoded =
         urlencoding::decode(subpath).unwrap_or_else(|_| std::borrow::Cow::Borrowed(subpath));
@@ -1564,10 +1927,11 @@ const STYLE_CSS: &str = include_str!("templates/style.css");
 /// 全部前端 JS（编译期嵌入）。
 const APP_JS: &str = include_str!("templates/app.js");
 
-fn render_page(title: &str, breadcrumb: &str, body: &str) -> String {
+fn render_page(title: &str, breadcrumb: &str, dirswitch: &str, body: &str) -> String {
     PAGE_TEMPLATE
         .replace("{TITLE}", title)
         .replace("{BREADCRUMB}", breadcrumb)
+        .replace("{DIRSWITCH}", dirswitch)
         .replace("{CSS}", STYLE_CSS)
         .replace("{SCRIPT}", APP_JS)
         .replace("{BODY}", body)

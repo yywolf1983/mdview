@@ -26,3 +26,10 @@ desktop.ini
 *.log
 tmp/
 temp/
+
+# ==== 本地配置（含密码占位符与真实目录路径，不入库） ====
+mdview.toml
+# 如需团队共享模板，请提交 mdview.toml.example 而非 mdview.toml
+
+# ==== 交叉编译产物 ====
+/dist/

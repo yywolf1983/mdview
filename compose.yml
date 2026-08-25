@@ -1,0 +1,26 @@
+# podman-compose 配置（兼容 docker-compose v3 语法）
+# 启动：podman-compose -f compose.yml up -d --build
+# 查看：podman-compose -f compose.yml ps
+# 停止：podman-compose -f compose.yml down
+
+services:
+  mdview:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: mdview:latest
+    container_name: mdview
+    # 用宿主当前工作目录作为待浏览目录，按需自行增删卷映射
+    volumes:
+      - ./mdview.toml:/app/mdview.toml:ro       # 配置文件（只读）
+      - ./docs:/data/docs:ro                     # 示例文档目录（只读）
+      - /Users/yy/notes:/data/notes:ro           # 换成你自己的笔记目录
+    ports:
+      - "9880:9880"
+    environment:
+      # 覆盖容器内默认监听/配置（一般不需要改）
+      MDVIEW_CONFIG: /app/mdview.toml
+    # 如只在本机访问，建议绑定 127.0.0.1:9880，更安全
+    # ports:
+    #   - "127.0.0.1:9880:9880"
+    restart: unless-stopped

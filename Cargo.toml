@@ -17,3 +17,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 urlencoding = "2"
 syntect = "5"
+toml = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"

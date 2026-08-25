@@ -1,0 +1,7 @@
+# 避免把不必要的文件拷进容器构建上下文
+target/
+dist/
+.git/
+.gitignore
+*.swp
+.DS_Store
