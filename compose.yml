@@ -12,9 +12,13 @@ services:
     container_name: mdview
     # 用宿主当前工作目录作为待浏览目录，按需自行增删卷映射
     volumes:
-      - ./mdview.toml:/app/mdview.toml:ro       # 配置文件（只读）
-      - ./docs:/data/docs:ro                     # 示例文档目录（只读）
-      - /Users/yy/notes:/data/notes:ro           # 换成你自己的笔记目录
+      - ./mdview.toml:/app/mdview.toml:rw       # 配置文件（只读）
+      - /Users/yy/aaa/yy/notes:/data/notes:rw           # 换成你自己的笔记目录
+      - /Users/yy/aaa/yy:/data/yy:rw           # 换成你自己的笔记目录
+      - /Users/yy/aaa/blog:/data/blog:rw           # 换成你自己的笔记目录
+    userns_mode: "keep-id"
+    security_opt:
+      - label=disable
     ports:
       - "9880:9880"
     environment:

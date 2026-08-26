@@ -1,14 +1,15 @@
 # 用 podman-compose 做 musl 交叉编译（本地 macOS 跑，产出 Linux 静态二进制）
 #
 # 用法：
-#   # 默认编 x86_64 静态二进制
+#   # 默认编 arm64（aarch64）静态二进制（arm64 容器内同架构原生编译）
 #   podman-compose -f cross-compose.yml run --rm build
 #
-#   # 编 arm64（aarch64）静态二进制
-#   podman-compose -f cross-compose.yml run --rm -e TARGET=aarch64-unknown-linux-musl build
+#   # 同时编多个目标（目前仅配置了 arm64 的 C 编译/链接环境）
+#   podman-compose -f cross-compose.yml run --rm -e TARGETS="aarch64-unknown-linux-musl" build
 #
-#   # 同时编多个目标
-#   podman-compose -f cross-compose.yml run --rm -e TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl" build
+#   # 注：x86_64-unknown-linux-musl 在 arm64 容器内缺少 x86_64 musl 交叉 gcc
+#   #     （aarch64 的 musl-gcc 无法输出 x86_64 代码），要编 x86_64 请改用
+#   #     cargo-zigbuild（见 README）或换成 amd64 容器。
 #
 # 产物输出到宿主 ./dist/ 目录
 
@@ -17,6 +18,7 @@ services:
     build:
       context: .
       dockerfile: cross.Dockerfile
+      platform: linux/arm64
     image: mdview-cross:latest
     container_name: mdview-cross
     # 把宿主源码挂进容器（避免每次重建镜像）
@@ -25,27 +27,37 @@ services:
       - ./dist:/out:z          # 编译产物落盘到宿主 dist/
       - cargo-registry:/usr/local/cargo/registry   # 缓存 crate，加速重复构建
     environment:
-      # 单目标（覆盖默认 x86_64）；与 TARGETS 二选一
-      TARGET: "x86_64-unknown-linux-musl"
+      # 单目标（默认 aarch64，arm64 容器内同架构原生编译）；与 TARGETS 二选一
+      TARGET: "aarch64-unknown-linux-musl"
       # 多目标（空格分隔）；设置后优先于 TARGET
       TARGETS: ""
-      # 静态链接 musl 的 C 依赖（如 future openssl），无需也可留空
-      CC_x86_64_unknown_linux_musl: "musl-gcc"
-      CC_aarch64_unknown_linux_musl: "aarch64-linux-gnu-gcc"
+      # 用 musl-gcc 编译 C 依赖（syntect 的 onig_sys 等）
+      CC_aarch64_unknown_linux_musl: "musl-gcc"
+      # 用 musl-gcc 做最终链接，保证纯静态（不混入 glibc）
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: "musl-gcc"
     # 覆盖默认 CMD：根据 TARGETS / TARGET 编译并拷贝产物
     command:
       - bash
       - -lc
       - |
         set -e
+        # 显式把 cargo 加入 PATH（官方 rust 镜像装在 /usr/local/cargo）
+        export RUSTUP_HOME=/usr/local/rustup
+        export CARGO_HOME=/usr/local/cargo
+        export PATH="/usr/local/cargo/bin:$PATH"
+        # 兜底：cargo 仍找不到时打印环境，便于排查（多半是镜像 tag 拉错）
+        command -v cargo >/dev/null 2>&1 || {
+          echo "[错误] 容器内找不到 cargo，当前 PATH=$PATH"
+          echo "[错误] /usr/local/cargo/bin 内容："
+          ls -la /usr/local/cargo/bin 2>&1 || true
+          exit 1
+        }
         if [ -n "$TARGETS" ]; then
           for t in $TARGETS; do
-            rustup target add "$t"
             cargo build --release --target "$t"
             cp "target/$t/release/mdview" "/out/mdview-$(echo $t | cut -d- -f1)"
           done
         else
-          rustup target add "$TARGET"
           cargo build --release --target "$TARGET"
           cp "target/$TARGET/release/mdview" "/out/mdview-$(echo $TARGET | cut -d- -f1)"
         fi

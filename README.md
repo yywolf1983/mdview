@@ -107,9 +107,9 @@ mdview --config ~/mdview.toml
 mdview/
 ├── Cargo.toml           # 项目配置与依赖
 ├── Containerfile        # 运行镜像：多阶段构建 Rust 二进制
-├── cross.Dockerfile     # 交叉编译镜像：musl 静态编译 Linux 二进制
+├── cross.Dockerfile     # （已弃用）旧交叉编译镜像，见 README「交叉编译」说明
 ├── compose.yml          # podman-compose：本地/服务器运行服务
-├── cross-compose.yml    # podman-compose：在容器内做 musl 交叉编译
+├── cross-compose.yml    # （已弃用）旧容器内编译编排，见 README「交叉编译」说明
 ├── mdview.toml          # 运行配置：多目录 + 密码（首次自动生成示例）
 ├── .dockerignore        # 构建上下文忽略（target/dist 等）
 ├── src/
@@ -120,7 +120,7 @@ mdview/
 │       └── app.js            # 回到顶部 / 锚点模糊匹配 / 删除确认弹窗
 ├── docs/
 │   └── hello.md         # 示例文档
-├── dist/                # 交叉编译产物（mdview-x86_64 / mdview-aarch64）
+├── dist/                # （旧方案产物目录）改用 cargo-zigbuild 后产物在 target/<triple>/release/
 └── README.md
 ```
 
@@ -156,29 +156,47 @@ podman-compose -f compose.yml down
 
 访问 `http://127.0.0.1:9880`。注意：容器内 `mdview.toml` 使用容器路径（`/data/...`），待浏览目录必须通过 `compose.yml` 的 `volumes` 挂进容器（参考示例把 `/Users/yy/notes` 改成你自己的目录）。
 
-### 3. 交叉编译 Linux 静态二进制（podman-compose + musl）
+### 3. 交叉编译 Linux 静态二进制（cargo-zigbuild，本机直接编）
 
-无需本地 Rust 工具链，用 `cross-compose.yml` 在 Linux 容器内用 `x86_64-unknown-linux-musl` 静态编译，产物落到宿主 `./dist/`：
+无需 Docker / 虚拟机，在 macOS（含 Apple Silicon）或 Linux 本机直接用 [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) 交叉编译 **musl 静态二进制**。它借助 [Zig](https://ziglang.org) 作为交叉链接器，支持一条命令产出 x86_64 / aarch64 的 Linux 静态可执行文件。
+
+#### 安装工具链
 
 ```bash
-# 默认编 x86_64 静态二进制 -> dist/mdview-x86_64
-podman-compose -f cross-compose.yml run --rm build
+# 1) 安装 Zig 编译器
+brew install zig
 
-# 编 arm64 静态二进制
-podman-compose -f cross-compose.yml run --rm -e TARGET=aarch64-unknown-linux-musl build
+# 2) 安装 cargo-zigbuild（Rust 子命令）
+cargo install cargo-zigbuild
+# 或者用 pip 安装（会自动拉取 ziglang，可省略上面的 brew 步骤）
+# pip install cargo-zigbuild
+```
+
+#### 编译
+
+```bash
+# 编 x86_64 静态二进制 -> target/x86_64-unknown-linux-musl/release/mdview
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# 编 aarch64 静态二进制（Apple Silicon Mac 也能直接编）
+cargo zigbuild --release --target aarch64-unknown-linux-musl
 
 # 一次编多个目标
-podman-compose -f cross-compose.yml run --rm \
-  -e TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl" build
+cargo zigbuild --release \
+  --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 ```
 
 产物为 musl 静态链接，可在任意对应架构的 Linux 发行版直接运行（无需 glibc）：
 
 ```bash
-file dist/mdview-x86_64     # 应显示 "statically linked"
+file target/x86_64-unknown-linux-musl/release/mdview   # 应显示 "statically linked"
 ```
 
-> 本项目依赖均为纯 Rust（axum / tokio / syntect 等），musl 下直接静态链接成功，无需 C 交叉编译器。
+> 本项目依赖均为纯 Rust（axum / tokio / syntect 等），musl 下直接静态链接成功，无需额外 C 交叉编译器。
+
+#### （旧方案，已弃用）podman-compose + musl 镜像
+
+早期版本用 `cross-compose.yml` + `cross.Dockerfile` 在 Linux 容器内编译，现已不再推荐（需 Docker 镜像且国内拉取受限）。相关文件保留仅供参考，建议改用上面的 cargo-zigbuild 方案。
 
 ## 安全设计
 
