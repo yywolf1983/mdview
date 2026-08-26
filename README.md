@@ -147,11 +147,18 @@ path = "/data/notes"
 
 ```bash
 # 构建并后台启动
-podman-compose -f compose.yml up -d --build
+podman build -f cross.Dockerfile -t mdview-cross
+
+podman-compose -f cross-compose.yml run --rm \    
+  -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
 
 # 查看 / 停止
+podman build -f Containerfile -t mdview
+
 podman-compose -f compose.yml ps
 podman-compose -f compose.yml down
+
+重新编译后要重启才能生效
 ```
 
 访问 `http://127.0.0.1:9880`。注意：容器内 `mdview.toml` 使用容器路径（`/data/...`），待浏览目录必须通过 `compose.yml` 的 `volumes` 挂进容器（参考示例把 `/Users/yy/notes` 改成你自己的目录）。

@@ -28,6 +28,9 @@
     initSearchBox();
   }
 })();
+
+/* ---------- Floating Back to Top ---------- */
+(function(){
   const THRESHOLD = 360;
   const btn = document.createElement('button');
   btn.type = 'button';
