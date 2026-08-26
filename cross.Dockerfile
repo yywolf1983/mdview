@@ -1,19 +1,33 @@
-# 交叉编译镜像：在 Linux 容器里用 musl 静态编译 Linux 二进制
-# 宿主（macOS/Windows/Linux）只需有 podman，无需本地 Rust 工具链
-# 用 bookworm 版官方镜像：必带 cargo/rustup，且提供 arm64 原生架构
+# 使用 arm64 原生 Rust 镜像（M 芯片最优）
 FROM docker.io/library/rust:1.97.1-bookworm-linuxarm64
 
-# 安装 musl 工具链（提供 musl-gcc，用于 C 依赖的静态链接兜底）
+# 1. 基础工具（Debian bookworm arm64 全部支持）
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        musl-tools \
+        ca-certificates \
+        mingw-w64 \
+        binutils-mingw-w64 \
+        curl \
+        xz-utils \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 构建期预装两个 musl 目标（bookworm 镜像自带 rustup）
-RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# 2. 安装 zig（官方二进制，不依赖 apt）
+#    这是 arm64 容器里唯一可靠的方式
+ENV ZIG_VERSION=0.13.0
+RUN curl -L https://ziglang.org/download/${ZIG_VERSION}/zig-linux-aarch64-${ZIG_VERSION}.tar.xz \
+    | tar -xJ -C /usr/local \
+    && ln -s /usr/local/zig-linux-aarch64-${ZIG_VERSION}/zig /usr/local/bin/zig \
+    && zig version
+
+# 3. 安装 cargo-zigbuild
+RUN cargo install cargo-zigbuild
+
+# 4. Rust 交叉编译目标
+RUN rustup target add \
+        aarch64-unknown-linux-musl \
+        x86_64-unknown-linux-musl \
+        x86_64-pc-windows-gnu
 
 WORKDIR /app
-COPY . .
-
-# 默认编译 aarch64 静态二进制（arm64 容器内同架构编译；可被 compose 的 command 覆盖）
-CMD ["bash", "-lc", "cargo build --release --target aarch64-unknown-linux-musl \
-     && cp target/aarch64-unknown-linux-musl/release/mdview /out/mdview-linux-arm64"]

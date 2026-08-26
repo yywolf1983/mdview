@@ -1,18 +1,18 @@
-# 用 podman-compose 做 musl 交叉编译（本地 macOS 跑，产出 Linux 静态二进制）
+# ============================================================
+#  podman-compose 交叉编译编排（最终稳定版 · 无 bash 语法冲突）
+# ------------------------------------------------------------
+#  关键修正：
+#  1. command 不再内联复杂 bash（避免 podman-compose 解析 ${} 报错）
+#  2. 所有 bash 数组 / 插值语法移到 cross-build.sh
+#  3. TARGETS: "${TARGETS:-}" 允许 run -e 覆盖
+#  4. platform: linux/arm64 保证 M 芯片原生运行
 #
-# 用法：
-#   # 默认编 arm64（aarch64）静态二进制（arm64 容器内同架构原生编译）
-#   podman-compose -f cross-compose.yml run --rm build
-#
-#   # 同时编多个目标（目前仅配置了 arm64 的 C 编译/链接环境）
-#   podman-compose -f cross-compose.yml run --rm -e TARGETS="aarch64-unknown-linux-musl" build
-#
-#   # 注：x86_64-unknown-linux-musl 在 arm64 容器内缺少 x86_64 musl 交叉 gcc
-#   #     （aarch64 的 musl-gcc 无法输出 x86_64 代码），要编 x86_64 请改用
-#   #     cargo-zigbuild（见 README）或换成 amd64 容器。
-#
-# 产物输出到宿主 ./dist/ 目录
-
+#  用法：
+#    podman-compose -f cross-compose.yml run --rm build
+#    podman-compose -f cross-compose.yml run --rm \
+#      -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
+#      build
+# ============================================================
 services:
   build:
     build:
@@ -21,48 +21,30 @@ services:
       platform: linux/arm64
     image: mdview-cross:latest
     container_name: mdview-cross
-    # 把宿主源码挂进容器（避免每次重建镜像）
     volumes:
       - ./:/app:z
-      - ./dist:/out:z          # 编译产物落盘到宿主 dist/
-      - cargo-registry:/usr/local/cargo/registry   # 缓存 crate，加速重复构建
+      - ./dist:/out:z
+      - cargo-registry:/usr/local/cargo/registry
     environment:
-      # 单目标（默认 aarch64，arm64 容器内同架构原生编译）；与 TARGETS 二选一
+      # 默认单目标
       TARGET: "aarch64-unknown-linux-musl"
-      # 多目标（空格分隔）；设置后优先于 TARGET
-      TARGETS: ""
-      # 用 musl-gcc 编译 C 依赖（syntect 的 onig_sys 等）
+      # 多目标（关键：允许 podman-compose run -e 覆盖）
+      TARGETS: "${TARGETS:-}"
+
+      # aarch64 原生（musl-gcc）
       CC_aarch64_unknown_linux_musl: "musl-gcc"
-      # 用 musl-gcc 做最终链接，保证纯静态（不混入 glibc）
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: "musl-gcc"
-    # 覆盖默认 CMD：根据 TARGETS / TARGET 编译并拷贝产物
-    command:
-      - bash
-      - -lc
-      - |
-        set -e
-        # 显式把 cargo 加入 PATH（官方 rust 镜像装在 /usr/local/cargo）
-        export RUSTUP_HOME=/usr/local/rustup
-        export CARGO_HOME=/usr/local/cargo
-        export PATH="/usr/local/cargo/bin:$PATH"
-        # 兜底：cargo 仍找不到时打印环境，便于排查（多半是镜像 tag 拉错）
-        command -v cargo >/dev/null 2>&1 || {
-          echo "[错误] 容器内找不到 cargo，当前 PATH=$PATH"
-          echo "[错误] /usr/local/cargo/bin 内容："
-          ls -la /usr/local/cargo/bin 2>&1 || true
-          exit 1
-        }
-        if [ -n "$TARGETS" ]; then
-          for t in $TARGETS; do
-            cargo build --release --target "$t"
-            cp "target/$t/release/mdview" "/out/mdview-$(echo $t | cut -d- -f1)"
-          done
-        else
-          cargo build --release --target "$TARGET"
-          cp "target/$TARGET/release/mdview" "/out/mdview-$(echo $TARGET | cut -d- -f1)"
-        fi
-        echo "=== 产物 ==="
-        ls -lh /out
+
+      # x86_64 musl（zigbuild）
+      # Windows（mingw）
+      CC_x86_64_pc_windows_gnu: "x86_64-w64-mingw32-gcc"
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: "x86_64-w64-mingw32-gcc"
+
+      # 启用 zigbuild（处理含 C 依赖的 musl 目标）
+      USE_ZIGBUILD: "1"
+
+    # ✅ 关键：只调用脚本，不写复杂 bash
+    command: ["/app/cross-build.sh"]
 
 volumes:
   cargo-registry:
