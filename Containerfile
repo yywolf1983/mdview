@@ -3,7 +3,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-COPY ./dist/mdview-aarch64 /usr/local/bin/mdview
+COPY ./dist/mdview-linux-arm64 /usr/local/bin/mdview
 # 配置文件与待浏览目录挂载进容器
 COPY mdview.toml /app/mdview.toml
 VOLUME ["/data"]
