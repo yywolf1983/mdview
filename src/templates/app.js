@@ -1,5 +1,33 @@
-/* ---------- Floating Back to Top ---------- */
+/* ---------- Search box: restore query from URL (on /search) ---------- */
 (function(){
+  function initSearchBox() {
+    const box = document.querySelector('form.search-box');
+    if (!box) return;
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('q');
+    const ty = params.get('ty');
+    if (q) {
+      const input = box.querySelector('input[name="q"]');
+      if (input && !input.value) input.value = q;
+    }
+    if (ty) {
+      const sel = box.querySelector('select[name="ty"]');
+      if (sel) sel.value = ty;
+    }
+    // 在搜索结果页聚焦输入框
+    if (window.location.pathname === '/search') {
+      const input = box.querySelector('input[name="q"]');
+      if (input && document.activeElement !== input) {
+        try { input.focus(); input.select(); } catch(_) {}
+      }
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initSearchBox);
+  } else {
+    initSearchBox();
+  }
+})();
   const THRESHOLD = 360;
   const btn = document.createElement('button');
   btn.type = 'button';

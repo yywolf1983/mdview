@@ -18,7 +18,18 @@
       <h1><span class="logo">📖</span>{TITLE}</h1>
       <div class="breadcrumb">{BREADCRUMB}</div>
     </div>
-    <div class="site-header-side">{DIRSWITCH}</div>
+    <div class="site-header-side">
+      <form class="search-box" method="get" action="/search" role="search">
+        <input type="search" name="q" class="search-input" placeholder="搜索文件名或内容…" autocomplete="off" spellcheck="false">
+        <select name="ty" class="search-type" aria-label="搜索类型">
+          <option value="all">文件名 + 内容</option>
+          <option value="name">仅文件名</option>
+          <option value="content">仅内容</option>
+        </select>
+        <button type="submit" class="search-btn">🔍</button>
+      </form>
+      {DIRSWITCH}
+    </div>
   </header>
   <div class="md-body">
     {BODY}
