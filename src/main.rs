@@ -123,18 +123,24 @@ struct LoginForm {
     password: String,
 }
 
-/// 搜索参数（GET /search?q=...&type=...&root=...）
+/// 搜索参数（GET /search?q=...&type=...&mode=...&root=...&path=...）
 #[derive(Deserialize, Debug, Default)]
 struct SearchParams {
-    /// 查询关键词（空格分隔，多词为 AND 匹配）
+    /// 查询关键词（空格分隔）
     #[serde(default)]
     q: String,
     /// 搜索范围：all=文件名+内容, name=仅文件名, content=仅内容
     #[serde(default)]
     ty: String,
+    /// 多词关系：and=同时包含(默认), or=任一包含
+    #[serde(default)]
+    mode: String,
     /// 目标目录索引（默认用当前激活目录）
     #[serde(default)]
     root: Option<usize>,
+    /// 在当前激活目录下的子目录（相对路径）。为空则搜整个激活目录（即“当前项目”）
+    #[serde(default)]
+    path: String,
 }
 
 /// 单条搜索结果
@@ -146,8 +152,12 @@ struct SearchHit {
     /// dir / md / img / code / txt / bin
     kind: String,
     is_dir: bool,
-    /// 内容匹配时的命中摘要（带高亮片段的 HTML 行，已转义）
-    snippet: Option<String>,
+    /// 是否因文件名匹配（区分文件名命中 vs 内容命中）
+    name_match: bool,
+    /// 内容匹配时的命中行数（跨行统计，用于展示）
+    match_count: usize,
+    /// 内容命中的代表性片段（带高亮，已转义，最多若干行）
+    snippets: Vec<String>,
 }
 
 // ===================== 认证工具 =====================
@@ -881,8 +891,9 @@ async fn search_page(
     } else {
         "all".to_string()
     };
+    let mode_or = params.mode == "or";
 
-    // 确定搜索根目录
+    // 确定搜索根目录（当前激活的项目）
     let idx = params.root.unwrap_or_else(|| selected_index(&headers, &state));
     let resolved = state
         .dirs
@@ -891,19 +902,44 @@ async fn search_page(
         .unwrap_or_else(|| state.dirs[0].clone());
     let root = resolved.root.clone();
 
+    // 搜索起点：当前浏览的子目录（相对项目根）。为空则搜整个激活目录（即“当前项目”）。
+    // 用 resolve_path 做安全解析，阻止 ../ 目录遍历。
+    let start_dir = if params.path.trim().is_empty() {
+        root.clone()
+    } else {
+        resolve_path(&root, &params.path)
+    };
+    // 若解析结果越界（不在该激活目录内），回退到项目根
+    let start_dir = if start_dir.starts_with(&root) {
+        start_dir
+    } else {
+        root.clone()
+    };
+
     // 搜索框已常驻于页头，这里仅渲染结果区
     let switcher = dir_switcher_html(&state, &headers);
 
     let (hits, elapsed_ms) = if q.is_empty() {
         (Vec::new(), 0u128)
     } else {
-        let start = std::time::Instant::now();
-        let hits = do_search(&root, &q, &ty);
-        let elapsed = start.elapsed().as_millis();
+        let start_t = std::time::Instant::now();
+        let hits = do_search(&start_dir, &q, &ty, mode_or);
+        let elapsed = start_t.elapsed().as_millis();
         (hits, elapsed)
     };
 
-    let body = search_results_html(&q, &ty, &hits, elapsed_ms, &resolved.name);
+    // 展示用的搜索起点（相对项目根，便于说明“搜索范围”）
+    let scope = if start_dir == root {
+        resolved.name.clone()
+    } else {
+        let rel = start_dir
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        format!("{} / {}", resolved.name, rel)
+    };
+
+    let body = search_results_html(&q, &ty, &hits, elapsed_ms, &scope);
     let title = if q.is_empty() {
         "搜索".to_string()
     } else {
@@ -919,8 +955,9 @@ async fn search_page(
 }
 
 /// 执行递归搜索，返回按相对路径排序的结果列表
-fn do_search(root: &FsPath, q: &str, ty: &str) -> Vec<SearchHit> {
-    // 关键词：小写、按空白拆分（多词 AND 匹配）
+/// - mode_or: 多词之间是 OR（任一出现即命中）还是 AND（全部出现）；AND 可跨行
+fn do_search(root: &FsPath, q: &str, ty: &str, mode_or: bool) -> Vec<SearchHit> {
+    // 关键词：小写、按空白拆分（保留空 term 过滤）
     let terms: Vec<String> = q
         .to_lowercase()
         .split_whitespace()
@@ -934,10 +971,10 @@ fn do_search(root: &FsPath, q: &str, ty: &str) -> Vec<SearchHit> {
     let match_content = ty != "name";
 
     let mut hits: Vec<SearchHit> = Vec::new();
-    // 限制：递归深度、已读文件数、结果数，避免极端情况下卡死
-    const MAX_DEPTH: usize = 12;
-    const MAX_FILES: usize = 3000;
-    const MAX_RESULTS: usize = 200;
+    // 放宽限制，避免大目录漏搜（仍设上限防止极端卡死）
+    const MAX_DEPTH: usize = 24;
+    const MAX_FILES: usize = 50000;
+    const MAX_RESULTS: usize = 500;
 
     let _ = walk_and_search(
         root,
@@ -945,6 +982,7 @@ fn do_search(root: &FsPath, q: &str, ty: &str) -> Vec<SearchHit> {
         &terms,
         match_name,
         match_content,
+        mode_or,
         &mut hits,
         &mut 0usize,
         MAX_DEPTH,
@@ -963,6 +1001,7 @@ fn walk_and_search(
     terms: &[String],
     match_name: bool,
     match_content: bool,
+    mode_or: bool,
     hits: &mut Vec<SearchHit>,
     files_scanned: &mut usize,
     depth: usize,
@@ -976,7 +1015,7 @@ fn walk_and_search(
     for e in fs::read_dir(dir)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().to_string();
-        // 跳过隐藏项（与列表浏览保持一致）
+        // 跳过隐藏项（与列表浏览保持一致：.git 等不纳入搜索）
         if name.starts_with('.') {
             continue;
         }
@@ -1008,16 +1047,18 @@ fn walk_and_search(
             .replace('\\', "/");
 
         if is_dir {
-            // 目录：仅按名称匹配
+            // 目录：仅按名称匹配（AND/OR 均可）
             let name_lc = name.to_lowercase();
-            let name_hit = match_name && terms.iter().all(|t| name_lc.contains(t));
+            let name_hit = match_name && term_match(&name_lc, terms, mode_or);
             if name_hit {
                 hits.push(SearchHit {
                     name: name.clone(),
                     rel,
                     kind: "dir".to_string(),
                     is_dir: true,
-                    snippet: None,
+                    name_match: true,
+                    match_count: 0,
+                    snippets: Vec::new(),
                 });
             }
             walk_and_search(
@@ -1026,6 +1067,7 @@ fn walk_and_search(
                 terms,
                 match_name,
                 match_content,
+                mode_or,
                 hits,
                 files_scanned,
                 depth - 1,
@@ -1034,35 +1076,32 @@ fn walk_and_search(
             )?;
         } else {
             *files_scanned += 1;
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
             let kind = file_kind(&path);
             let name_lc = name.to_lowercase();
 
-            // 文件名匹配（对所有可查看文件生效）
-            let name_hit = match_name && kind != "bin" && terms.iter().all(|t| name_lc.contains(t));
+            // 文件名匹配：对所有文件（含 bin）生效
+            let name_hit = match_name && term_match(&name_lc, terms, mode_or);
+
             // 内容匹配（仅对文本类文件）
-            let mut snippet: Option<String> = None;
-            if match_content && is_text_viewable(&path) {
-                if let Ok(meta) = entry.metadata() {
-                    // 单文件超过 2MB 跳过内容扫描
-                    if meta.len() <= 2 * 1024 * 1024 {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            snippet = find_content_snippet(&content, terms, &ext);
-                        }
-                    }
-                }
-            }
-            if name_hit || snippet.is_some() {
+            let (mut snippets, match_count) = if match_content && is_text_viewable(&path) {
+                read_file_lossy(&entry)
+                    .map(|content| find_content_snippets(&content, terms, mode_or))
+                    .unwrap_or_default()
+            } else {
+                (Vec::new(), 0usize)
+            };
+
+            if name_hit || match_count > 0 {
+                // 文件名命中但未命中内容时，也展示文件名匹配标记
+                snippets.truncate(3);
                 hits.push(SearchHit {
                     name: name.clone(),
                     rel,
                     kind: kind.to_string(),
                     is_dir: false,
-                    snippet,
+                    name_match: name_hit,
+                    match_count,
+                    snippets,
                 });
             }
         }
@@ -1073,19 +1112,64 @@ fn walk_and_search(
     Ok(())
 }
 
-/// 在文件内容中查找首个同时满足所有 term 的行，并生成带高亮片段的 HTML（已转义）
-fn find_content_snippet(content: &str, terms: &[String], _ext: &str) -> Option<String> {
-    let mut matched: Option<&str> = None;
+/// 判断字符串是否满足关键词关系（AND: 全部包含；OR: 任一包含）
+fn term_match(haystack_lc: &str, terms: &[String], mode_or: bool) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    if mode_or {
+        terms.iter().any(|t| haystack_lc.contains(t))
+    } else {
+        terms.iter().all(|t| haystack_lc.contains(t))
+    }
+}
+
+/// 容错读取文本内容（非法 UTF-8 用 lossy 替代，避免整文件跳过）
+fn read_file_lossy(entry: &std::fs::DirEntry) -> Option<String> {
+    let meta = entry.metadata().ok()?;
+    // 超大文件只读前 4MB，兼顾性能与覆盖
+    const CAP: u64 = 4 * 1024 * 1024;
+    if meta.len() > CAP {
+        let mut f = std::fs::File::open(entry.path()).ok()?;
+        use std::io::Read;
+        let mut buf = vec![0u8; CAP as usize];
+        let n = f.read(&mut buf).ok()?;
+        buf.truncate(n);
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    } else {
+        let bytes = fs::read(entry.path()).ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// 在文件内容中查找命中行：返回（带高亮的代表行片段，命中行总数）
+/// - AND：所有 term 同时出现于同一行才算该行命中（跨行命中由多行统计体现）
+/// - OR：任一 term 出现即命中
+/// 这里收集所有命中行（最多到上限），用于后续截断展示前 3 行
+fn find_content_snippets(content: &str, terms: &[String], mode_or: bool) -> (Vec<String>, usize) {
+    let mut lines_out: Vec<String> = Vec::new();
+    let mut count = 0usize;
     for line in content.lines() {
         let lc = line.to_lowercase();
-        if terms.iter().all(|t| lc.contains(t)) {
-            matched = Some(line);
-            break;
+        let hit = if mode_or {
+            terms.iter().any(|t| lc.contains(t))
+        } else {
+            terms.iter().all(|t| lc.contains(t))
+        };
+        if hit {
+            count += 1;
+            // 仅保留前若干个片段用于展示（避免超大文件产生海量 HTML）
+            if lines_out.len() < 8 {
+                lines_out.push(highlight_line(line, terms));
+            }
         }
     }
-    let line = matched?;
+    (lines_out, count)
+}
+
+/// 对单行做高亮：转义后，把所有 term 出现处用 <mark> 包裹（大小写不敏感）
+fn highlight_line(line: &str, terms: &[String]) -> String {
     let esc = esc_html(line);
-    // 对命中关键词做 <mark> 高亮（大小写不敏感替换，逐词处理避免重叠）
     let mut out = String::with_capacity(esc.len());
     let chars: Vec<char> = esc.chars().collect();
     let lower: Vec<char> = esc.to_lowercase().chars().collect();
@@ -1115,7 +1199,7 @@ fn find_content_snippet(content: &str, terms: &[String], _ext: &str) -> Option<S
             i += 1;
         }
     }
-    Some(out)
+    out
 }
 
 /// 搜索结果页主体 HTML
@@ -1180,10 +1264,6 @@ fn search_results_html(
             "txt" => "📝",
             _ => "📦",
         };
-        let snippet = match &h.snippet {
-            Some(s) => format!(r#"<div class="hit-snippet">{s}</div>"#),
-            None => String::new(),
-        };
         let meta = if h.is_dir {
             "目录"
         } else {
@@ -1195,6 +1275,31 @@ fn search_results_html(
                 _ => "文件",
             }
         };
+        // 片段：文件名命中展示标记；内容命中展示多行高亮 + 命中行数
+        let mut snippet_html = String::new();
+        if h.is_dir {
+            // 目录无片段
+        } else if h.match_count > 0 {
+            let more = if h.match_count > h.snippets.len() {
+                format!(
+                    r#"<div class="hit-more">… 另有 {} 处命中</div>"#,
+                    h.match_count - h.snippets.len()
+                )
+            } else {
+                String::new()
+            };
+            let joined = h
+                .snippets
+                .iter()
+                .map(|s| format!(r#"<div class="hit-snippet-line">{}</div>"#, s))
+                .collect::<String>();
+            snippet_html = format!(
+                r#"<div class="hit-snippet"><span class="hit-count">{} 处命中</span>{}{}</div>"#,
+                h.match_count, joined, more
+            );
+        } else if h.name_match {
+            snippet_html = r#"<div class="hit-snippet hit-name-only">（文件名匹配）</div>"#.to_string();
+        }
         rows.push_str(&format!(
             r#"<li class="hit-item">
   <a class="hit-link" href="{url}">
@@ -1211,7 +1316,7 @@ fn search_results_html(
             name = esc_html(&h.name),
             meta = meta,
             rel = esc_html(&h.rel),
-            snippet = snippet,
+            snippet = snippet_html,
         ));
     }
 
@@ -1248,7 +1353,7 @@ fn dir_switcher_html(state: &AppState, headers: &HeaderMap) -> String {
     for (i, d) in state.dirs.iter().enumerate() {
         let active = if i == cur { " active" } else { "" };
         btns.push_str(&format!(
-            "<button type=\"button\" class=\"dir-tab{}\" data-idx=\"{}\" onclick=\"document.cookie='mdview_dir={}; Path=/; Max-Age=86400; SameSite=Lax'; location.reload();\">{}</button>",
+            "<button type=\"button\" class=\"dir-tab{}\" data-idx=\"{}\" onclick=\"document.cookie='mdview_dir={}; Path=/; Max-Age=86400; SameSite=Lax'; location.href='/';\">{}</button>",
             active, i, i, d.name
         ));
     }
@@ -1888,14 +1993,11 @@ fn is_image_ext(ext: &str) -> bool {
     )
 }
 
-/// 判断是否为可查看的文本 / 代码文件（按扩展名 + 特殊文件名）
+/// 判断是否为可查看的文本 / 代码文件（用于搜索内容扫描）
+/// 直接复用 file_kind 的判定，确保 .md / .txt / .log / 代码等都能被纳入内容搜索
 fn is_text_viewable(path: &FsPath) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    is_text_ext(&ext) || has_text_file_name(path)
+    let kind = file_kind(path);
+    kind != "img" && kind != "bin"
 }
 
 /// 常见的文本 / 代码扩展名（ext 需为小写）

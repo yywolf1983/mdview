@@ -145,6 +145,13 @@ body {
   padding: 4px 6px; border-radius: 999px; cursor: pointer;
 }
 .search-type option { color: #1f2937; }
+.search-mode {
+  appearance: none; -webkit-appearance: none;
+  border: none; background: rgba(255,255,255,0.18);
+  color: #fff; font-size: 0.78em; font-weight: 600;
+  padding: 4px 6px; border-radius: 999px; cursor: pointer;
+}
+.search-mode option { color: #1f2937; }
 .search-btn {
   appearance: none; border: none; cursor: pointer;
   background: linear-gradient(135deg, #6366f1, #8b5cf6);
@@ -187,6 +194,11 @@ body {
   padding: 6px 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
 }
 .hit-snippet mark { background: #fde68a; color: #92400e; padding: 0 2px; border-radius: 3px; }
+.hit-snippet { display: flex; flex-direction: column; gap: 4px; }
+.hit-count { align-self: flex-start; background: #eef2ff; color: #4f46e5; border-radius: 6px; padding: 1px 8px; font-weight: 600; font-size: 0.78em; margin-bottom: 2px; }
+.hit-snippet-line { white-space: pre-wrap; word-break: break-word; }
+.hit-more { font-size: 0.78em; color: #94a3b8; margin-top: 2px; }
+.hit-name-only { font-size: 0.82em; color: #64748b; font-style: italic; }
 
 /* 登录卡片 */
 .login-card { max-width: 360px; margin: 40px auto; text-align: center; }

@@ -1,25 +1,45 @@
-/* ---------- Search box: restore query from URL (on /search) ---------- */
+/* ---------- Search box: scope to current directory ---------- */
 (function(){
+  function currentBrowsePath() {
+    // URL 形如 /browse/项目/子目录 -> 返回 "项目/子目录"
+    const m = window.location.pathname.match(/^\/browse\/(.+)$/);
+    if (m) return decodeURIComponent(m[1]);
+    return '';
+  }
   function initSearchBox() {
     const box = document.querySelector('form.search-box');
     if (!box) return;
     const params = new URLSearchParams(window.location.search);
     const q = params.get('q');
     const ty = params.get('ty');
-    if (q) {
-      const input = box.querySelector('input[name="q"]');
-      if (input && !input.value) input.value = q;
-    }
-    if (ty) {
-      const sel = box.querySelector('select[name="ty"]');
-      if (sel) sel.value = ty;
-    }
-    // 在搜索结果页聚焦输入框
+    const mode = params.get('mode');
+    const pathField = box.querySelector('input[name="path"]');
+
     if (window.location.pathname === '/search') {
+      // 在搜索结果页：回填 URL 中的参数
+      if (q) {
+        const input = box.querySelector('input[name="q"]');
+        if (input && !input.value) input.value = q;
+      }
+      if (ty) {
+        const sel = box.querySelector('select[name="ty"]');
+        if (sel) sel.value = ty;
+      }
+      if (mode) {
+        const sel = box.querySelector('select[name="mode"]');
+        if (sel) sel.value = mode;
+      }
+      // 保持当前搜索范围（来自上次提交的 path）
+      if (pathField && !pathField.value) {
+        pathField.value = params.get('path') || '';
+      }
       const input = box.querySelector('input[name="q"]');
       if (input && document.activeElement !== input) {
         try { input.focus(); input.select(); } catch(_) {}
       }
+    } else {
+      // 在浏览页：搜索范围 = 当前浏览的子目录
+      if (pathField) pathField.value = currentBrowsePath();
     }
   }
   if (document.readyState === 'loading') {

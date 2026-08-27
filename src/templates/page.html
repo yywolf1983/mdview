@@ -20,11 +20,16 @@
     </div>
     <div class="site-header-side">
       <form class="search-box" method="get" action="/search" role="search">
-        <input type="search" name="q" class="search-input" placeholder="搜索文件名或内容…" autocomplete="off" spellcheck="false">
+        <input type="hidden" name="path" class="search-path" value="">
+        <input type="search" name="q" class="search-input" placeholder="搜索当前目录…" autocomplete="off" spellcheck="false">
         <select name="ty" class="search-type" aria-label="搜索类型">
           <option value="all">文件名 + 内容</option>
           <option value="name">仅文件名</option>
           <option value="content">仅内容</option>
+        </select>
+        <select name="mode" class="search-mode" aria-label="多词关系">
+          <option value="and">全部包含</option>
+          <option value="or">任一包含</option>
         </select>
         <button type="submit" class="search-btn">🔍</button>
       </form>
