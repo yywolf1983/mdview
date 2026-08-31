@@ -19,23 +19,10 @@
       <div class="breadcrumb">{BREADCRUMB}</div>
     </div>
     <div class="site-header-side">
-      <form class="search-box" method="get" action="/search" role="search">
-        <input type="hidden" name="path" class="search-path" value="">
-        <input type="search" name="q" class="search-input" placeholder="搜索当前目录…" autocomplete="off" spellcheck="false">
-        <select name="ty" class="search-type" aria-label="搜索类型">
-          <option value="all">文件名 + 内容</option>
-          <option value="name">仅文件名</option>
-          <option value="content">仅内容</option>
-        </select>
-        <select name="mode" class="search-mode" aria-label="多词关系">
-          <option value="and">全部包含</option>
-          <option value="or">任一包含</option>
-        </select>
-        <button type="submit" class="search-btn">🔍</button>
-      </form>
       {DIRSWITCH}
     </div>
   </header>
+  {TOOLBAR}
   <div class="md-body">
     {BODY}
   </div>
@@ -76,6 +63,31 @@
     <div class="modal-foot">
       <button type="button" class="ghost" data-rename-cancel>取消</button>
       <button type="button" class="primary" data-rename-confirm>✏ 确认重命名</button>
+    </div>
+  </div>
+</div>
+
+<!-- 全局新建弹窗 -->
+<div id="new-modal" class="modal-mask hidden" role="dialog" aria-modal="true" aria-labelledby="new-title">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-icon" aria-hidden="true">＋</div>
+      <div style="flex:1;min-width:0">
+        <h3 class="modal-title" id="new-title">新建文件 / 目录</h3>
+        <p class="modal-desc" id="new-parent-desc">将创建在当前目录</p>
+      </div>
+    </div>
+    <form id="new-form" class="modal-body new-modal-body" method="post" action="/api/new">
+      <input type="hidden" name="parent" id="new-parent" value="">
+      <input type="text" name="name" id="new-name" class="new-input" placeholder="输入名称（文件自动追加 .md）" autocomplete="off" spellcheck="false" required>
+      <label class="check">
+        <input type="checkbox" name="is_dir" value="true"> 作为目录创建
+      </label>
+      <p class="modal-err hidden" data-new-err></p>
+    </form>
+    <div class="modal-foot">
+      <button type="button" class="ghost" data-new-cancel>取消</button>
+      <button type="button" class="primary" data-new-confirm>＋ 创建</button>
     </div>
   </div>
 </div>

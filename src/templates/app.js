@@ -14,6 +14,7 @@
     const ty = params.get('ty');
     const mode = params.get('mode');
     const pathField = box.querySelector('input[name="path"]');
+    let scope = currentBrowsePath();
 
     if (window.location.pathname === '/search') {
       // 在搜索结果页：回填 URL 中的参数
@@ -30,16 +31,22 @@
         if (sel) sel.value = mode;
       }
       // 保持当前搜索范围（来自上次提交的 path）
-      if (pathField && !pathField.value) {
-        pathField.value = params.get('path') || '';
-      }
+      const urlPath = params.get('path') || '';
+      if (pathField && !pathField.value) pathField.value = urlPath;
+      scope = urlPath;
       const input = box.querySelector('input[name="q"]');
       if (input && document.activeElement !== input) {
         try { input.focus(); input.select(); } catch(_) {}
       }
     } else {
       // 在浏览页：搜索范围 = 当前浏览的子目录
-      if (pathField) pathField.value = currentBrowsePath();
+      if (pathField) pathField.value = scope;
+    }
+
+    // 更新第二栏的“当前目录”范围提示
+    const hint = document.getElementById('scope-hint');
+    if (hint) {
+      hint.textContent = scope ? ('📍 ' + scope) : '📍 项目根目录';
     }
   }
   if (document.readyState === 'loading') {
@@ -476,6 +483,82 @@ document.addEventListener('keydown', function(e) {
     document.addEventListener('keydown', function(e) {
       if (e.key === 'Escape' && !mask.classList.contains('hidden')) closeRenameModal();
     });
+  });
+})();
+/* ---------- New Entry Modal ---------- */
+(function(){
+  // 当前浏览目录（相对项目根），用于写入新建表单的 parent 字段
+  function currentParent() {
+    const m = window.location.pathname.match(/^\/browse\/(.+)$/);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  function openNewModal() {
+    const mask = document.getElementById('new-modal');
+    if (!mask) return;
+    const parent = currentParent();
+    const parentField = mask.querySelector('#new-parent');
+    if (parentField) parentField.value = parent;
+    const desc = mask.querySelector('#new-parent-desc');
+    if (desc) desc.textContent = parent ? ('将创建在：' + parent) : '将创建在当前项目根目录';
+    const input = mask.querySelector('#new-name');
+    const errEl = mask.querySelector('[data-new-err]');
+    if (errEl) errEl.classList.add('hidden');
+    if (input) { input.value = ''; input.focus(); }
+    mask.classList.remove('hidden');
+  }
+  function closeNewModal() {
+    const mask = document.getElementById('new-modal');
+    if (mask) mask.classList.add('hidden');
+  }
+  function submitNew() {
+    const mask = document.getElementById('new-modal');
+    if (!mask) return;
+    const input = mask.querySelector('#new-name');
+    const errEl = mask.querySelector('[data-new-err]');
+    const name = input ? input.value.trim() : '';
+    if (!name) {
+      if (errEl) { errEl.textContent = '名称不能为空'; errEl.classList.remove('hidden'); }
+      if (input) input.focus();
+      return;
+    }
+    if (name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) {
+      if (errEl) { errEl.textContent = '名称不能包含 / 或 \\'; errEl.classList.remove('hidden'); }
+      if (input) input.focus();
+      return;
+    }
+    // 校验通过，提交表单
+    const form = mask.querySelector('#new-form');
+    if (form) {
+      try {
+        form.requestSubmit();
+      } catch (_) {
+        form.submit();
+      }
+    }
+  }
+  document.addEventListener('DOMContentLoaded', function() {
+    const mask = document.getElementById('new-modal');
+    if (!mask) return;
+    mask.addEventListener('click', function(e) {
+      if (e.target === mask) closeNewModal();
+    });
+    const cancelBtn = mask.querySelector('[data-new-cancel]');
+    const confirmBtn = mask.querySelector('[data-new-confirm]');
+    const input = mask.querySelector('#new-name');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeNewModal);
+    if (confirmBtn) confirmBtn.addEventListener('click', submitNew);
+    if (input) {
+      input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); submitNew(); }
+        if (e.key === 'Escape') closeNewModal();
+      });
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && !mask.classList.contains('hidden')) closeNewModal();
+    });
+    // 打开按钮必须在 DOM 就绪后绑定（脚本位于 head，加载时按钮尚不存在）
+    const openBtn = document.getElementById('open-new-btn');
+    if (openBtn) openBtn.addEventListener('click', openNewModal);
   });
 })();
 /* ---------- Editor scroll takeover ----------

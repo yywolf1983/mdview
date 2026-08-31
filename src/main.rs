@@ -375,7 +375,7 @@ async fn index(
     let root = active_root(&headers, &state);
     let files = list_files(&root, &root).unwrap_or_default();
     let switcher = dir_switcher_html(&state, &headers);
-    let body = new_entry_form("") + &file_list_html(&files, true, "");
+    let body = file_list_html(&files, true, "");
     let html = render_page("Markdown 浏览器", "", &switcher, &body);
     Ok(Html(html))
 }
@@ -397,7 +397,7 @@ async fn browse(
         let rel_dir = display_rel(&root, &target);
         let title = format!("目录 /{}", rel_dir);
         let switcher = dir_switcher_html(&state, &headers);
-        let body = new_entry_form(&rel_dir) + &file_list_html(&files, false, &rel_dir);
+        let body = file_list_html(&files, false, &rel_dir);
         let html = render_page(
             &title,
             &breadcrumb(&root, &target),
@@ -835,7 +835,7 @@ async fn login_page() -> Html<String> {
     }
   </script>
 </div>"#;
-    Html(render_page("访问受限", "", "", body))
+    Html(render_page_inner("访问受限", "", "", body, false))
 }
 
 /// 登录提交（POST）
@@ -1546,25 +1546,6 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
     }
     html.push_str("</ul></div>");
     html
-}
-
-/// 当前目录顶部的「新建文件 / 新建目录」表单
-fn new_entry_form(parent: &str) -> String {
-    format!(
-        r#"<div class="new-form">
-  <div class="card">
-    <form method="post" action="/api/new">
-      <input type="hidden" name="parent" value="{parent}">
-      <input type="text" name="name" placeholder="输入名称（文件会自动追加 .md）" required>
-      <label class="check">
-        <input type="checkbox" name="is_dir" value="true"> 目录
-      </label>
-      <button type="submit" class="primary">＋ 新建</button>
-    </form>
-  </div>
-</div>"#,
-        parent = parent.replace('"', "&quot;")
-    )
 }
 
 /// MD 详情页顶部工具栏（编辑/删除 + 隐藏编辑器表单）
@@ -2421,12 +2402,43 @@ const PAGE_TEMPLATE: &str = include_str!("templates/page.html");
 const STYLE_CSS: &str = include_str!("templates/style.css");
 /// 全部前端 JS（编译期嵌入）。
 const APP_JS: &str = include_str!("templates/app.js");
+/// 第二栏工具栏（搜索 + 新建）。登录页不显示。
+const TOOLBAR_HTML: &str = r#"<div class="toolbar">
+  <form class="search-box" method="get" action="/search" role="search">
+    <input type="hidden" name="path" class="search-path" value="">
+    <span class="search-icon">🔍</span>
+    <input type="search" name="q" class="search-input" placeholder="搜索当前目录…" autocomplete="off" spellcheck="false">
+    <select name="ty" class="search-type" aria-label="搜索类型">
+      <option value="all">文件名 + 内容</option>
+      <option value="name">仅文件名</option>
+      <option value="content">仅内容</option>
+    </select>
+    <button type="submit" class="search-btn">搜索</button>
+  </form>
+  <div class="toolbar-right">
+    <span class="scope-hint" id="scope-hint" title="新建与搜索仅对当前进入的目录生效">📍 当前目录</span>
+    <button type="button" class="new-btn" id="open-new-btn">＋ 新建</button>
+  </div>
+</div>"#;
 
 fn render_page(title: &str, breadcrumb: &str, dirswitch: &str, body: &str) -> String {
+    render_page_inner(title, breadcrumb, dirswitch, body, true)
+}
+
+/// 渲染页面；show_toolbar=false 时不显示第二栏（用于登录页）
+fn render_page_inner(
+    title: &str,
+    breadcrumb: &str,
+    dirswitch: &str,
+    body: &str,
+    show_toolbar: bool,
+) -> String {
+    let toolbar = if show_toolbar { TOOLBAR_HTML } else { "" };
     PAGE_TEMPLATE
         .replace("{TITLE}", title)
         .replace("{BREADCRUMB}", breadcrumb)
         .replace("{DIRSWITCH}", dirswitch)
+        .replace("{TOOLBAR}", toolbar)
         .replace("{CSS}", STYLE_CSS)
         .replace("{SCRIPT}", APP_JS)
         .replace("{BODY}", body)
