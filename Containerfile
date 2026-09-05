@@ -1,8 +1,8 @@
-FROM localhost/debian-base:bookworm-v1.0.4-linuxarm64
+FROM my-alpine:v1
 WORKDIR /app
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk update \
+    && apk add --no-cache ca-certificates libssl3 \
+    && rm -rf /var/cache/apk/*
 COPY ./dist/mdview-linux-arm64 /usr/local/bin/mdview
 # 配置文件与待浏览目录挂载进容器
 COPY mdview.toml /app/mdview.toml
