@@ -1,5 +1,5 @@
 # 使用 arm64 原生 Rust 镜像（M 芯片最优）
-FROM docker.io/library/rust:1.97.1-bookworm-linuxarm64
+FROM rust:1.97.1-bookworm-linuxarm64
 
 # 1. 基础工具（Debian bookworm arm64 全部支持）
 RUN apt-get update \

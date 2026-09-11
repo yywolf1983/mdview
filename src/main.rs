@@ -1687,24 +1687,36 @@ fn normalize_rel(combined: &str) -> String {
 /// 保留 http:// / https:// / mailto: / # / / 开头的绝对 URL
 fn rewrite_relative_urls(html: &str, rel_dir: &str) -> String {
     let rewrite = |attr: &str, url: &str| -> String {
-        // 跳过绝对 / 外链 / 锚点
-        if url.starts_with("http://")
-            || url.starts_with("https://")
-            || url.starts_with("mailto:")
-            || url.starts_with("tel:")
-            || url.starts_with("data:")
-            || url.starts_with('#')
-            || url.starts_with('/')
-            || url.is_empty()
+        // pulldown_cmark 渲染时已经对非 ASCII 的 URL 做过百分号编码，
+        // 这里先整体解码回真实字符，再按路径段重新编码，避免双重编码。
+        let decoded = urlencoding::decode(url).unwrap_or_else(|_| std::borrow::Cow::Borrowed(url));
+        let decoded = decoded.as_ref();
+        // 跳过外链 / 协议相对 / 锚点 / data:
+        if decoded.starts_with("http://")
+            || decoded.starts_with("https://")
+            || decoded.starts_with("//")
+            || decoded.starts_with("mailto:")
+            || decoded.starts_with("tel:")
+            || decoded.starts_with("data:")
+            || decoded.starts_with('#')
+            || decoded.is_empty()
         {
             return format!("{}=\"{}\"", attr, url);
         }
+        // 以 / 开头：视为「站点根目录相对」路径（如 /images/foo.png），
+        // 去掉前导 / 后按根目录解析，不再当作外链跳过。
+        let starts_with_slash = decoded.starts_with('/');
+        let path_part = if starts_with_slash { &decoded[1..] } else { decoded };
+        if path_part.is_empty() {
+            return format!("{}=\"{}\"", attr, url);
+        }
         // 分离 URL 中的 anchor 与 query
-        let (main, rest) = match url.find(['#', '?']) {
-            Some(i) => (&url[..i], url[i..].to_string()),
-            None => (url, String::new()),
+        let (main, rest) = match path_part.find(['#', '?']) {
+            Some(i) => (&path_part[..i], path_part[i..].to_string()),
+            None => (path_part, String::new()),
         };
-        let combined = if rel_dir.is_empty() {
+        // 以 / 开头的是根目录相对，不再叠加当前 md 所在目录；其余按相对目录拼接
+        let combined = if starts_with_slash || rel_dir.is_empty() {
             main.to_string()
         } else {
             format!("{}/{}", rel_dir, main)
@@ -1736,13 +1748,39 @@ fn rewrite_relative_urls(html: &str, rel_dir: &str) -> String {
     // 替换 <a href="..."> / <a href='...'>
     // 替换 <img src="..."> / <img src='...'>
     let mut out = String::with_capacity(html.len());
-    let bytes = html.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        // 寻找 'href' 或 'src' 属性
+    while i < html.len() {
         let remain = &html[i..];
-        let lower = remain.to_ascii_lowercase();
-        let found = lower.find("href=").or_else(|| lower.find("src="));
+        let lower_remain = remain.to_ascii_lowercase();
+        // 跳过 <script> / <style> / <!-- 注释 内部，避免误改 JS/CSS 中的关键字
+        if lower_remain.starts_with("<script") {
+            if let Some(end) = lower_remain.find("</script>") {
+                out.push_str(&remain[..end + 9]);
+                i += end + 9;
+                continue;
+            }
+        } else if lower_remain.starts_with("<style") {
+            if let Some(end) = lower_remain.find("</style>") {
+                out.push_str(&remain[..end + 8]);
+                i += end + 8;
+                continue;
+            }
+        } else if remain.starts_with("<!--") {
+            if let Some(end) = remain.find("-->") {
+                out.push_str(&remain[..end + 3]);
+                i += end + 3;
+                continue;
+            }
+        }
+        // 取当前片段中「最早出现」的 href= 或 src=（不能只用 or_else，否则会跳过它之前的 src）
+        let hpos = lower_remain.find("href=");
+        let spos = lower_remain.find("src=");
+        let found = match (hpos, spos) {
+            (Some(h), Some(s)) => Some(h.min(s)),
+            (Some(h), None) => Some(h),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
         match found {
             None => {
                 out.push_str(remain);
