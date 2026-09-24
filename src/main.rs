@@ -1640,17 +1640,201 @@ fn display_rel(root: &FsPath, current: &FsPath) -> String {
         .to_string()
 }
 
+/// 把 Obsidian / R Markdown 风格的数学围栏代码块
+/// （```math、```latex、```tex，也可为 ~~~ 围栏）转换为 pulldown 支持的 `$$ ... $$` 块级公式。
+/// 其余代码块与普通文本不受影响。
+fn convert_math_code_fences(md: &str) -> String {
+    let lines: Vec<&str> = md.split('\n').collect();
+    let mut out = String::with_capacity(md.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_end();
+        // 识别围栏开头：连续 3 个以上 ` 或 ~，其后为 math/latex/tex 信息串
+        if let Some((_, info)) = parse_fence(trimmed) {
+            let info_l = info.trim().to_ascii_lowercase();
+            if info_l == "math" || info_l == "latex" || info_l == "tex" {
+                let mut body = String::new();
+                let mut closed = false;
+                i += 1;
+                while i < lines.len() {
+                    let l = lines[i];
+                    if is_closing_fence(l.trim_end()) {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    body.push_str(l);
+                    body.push('\n');
+                    i += 1;
+                }
+                if closed {
+                    out.push_str("$$\n");
+                    out.push_str(&body);
+                    out.push_str("$$\n");
+                    continue;
+                }
+                // 未闭合：原样保留
+                out.push_str(line);
+                out.push('\n');
+                i += 1;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// 解析围栏行。返回 (围栏字符, 信息串)。围栏必须位于行首（允许前导空白），
+/// 由连续的 3 个以上相同字符（` 或 ~）组成。
+fn parse_fence(line: &str) -> Option<(char, &str)> {
+    let l = line.trim_start();
+    let bytes = l.as_bytes();
+    if bytes.len() < 3 {
+        return None;
+    }
+    let c = bytes[0] as char;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    let mut n = 0;
+    while n < bytes.len() && (bytes[n] as char) == c {
+        n += 1;
+    }
+    if n < 3 {
+        return None;
+    }
+    // 信息串首字符不能是同一个围栏字符（避免 ```` ```` 这种边界情况）
+    let info = &l[n..];
+    if info.starts_with(c) {
+        return None;
+    }
+    Some((c, info))
+}
+
+/// 是否为闭合围栏：与开头同种字符、长度 >=3、且信息串为空。
+fn is_closing_fence(line: &str) -> bool {
+    parse_fence(line).map_or(false, |(_, info)| info.trim().is_empty())
+}
+
 fn render_markdown(md: &str) -> String {
+    // 先把 ```math / ```latex / ```tex 围栏块转换成 $$...$$（pulldown 只认 $ 语法）
+    let md = convert_math_code_fences(md);
+
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_MATH);
 
-    let parser = MdParser::new_ext(md, options);
+    let parser = MdParser::new_ext(&md, options);
     let mut html_output = String::new();
     pulldown_cmark::html::push_html(&mut html_output, parser);
-    html_output
+    // pulldown-cmark 0.13 把数学公式渲染成
+    //   <span class="math math-inline">…</span>
+    //   <span class="math math-display">…</span>
+    // 这里再转换成 MathJax v3 默认识别的 \( \) / \[ \] 分隔符，
+    // 内容本身已被 HTML 转义，浏览器在 DOM 文本中会还原，MathJax 可正确解析。
+    // 数学 span 先转成 MathJax 分隔符，再对 Markdown 内的 ```lang 代码块做语法高亮。
+    highlight_md_code_blocks(&wrap_math_spans(&html_output))
+}
+
+/// 把 Markdown 渲染结果里带语言标记的代码块（<pre><code class="language-XXX">）
+/// 用 syntect 做语法高亮（与代码查看页同一套主题）。无语言标记的代码块保持原样。
+fn highlight_md_code_blocks(html: &str) -> String {
+    const OPEN: &str = "<pre><code class=\"language-";
+    const CLOSE: &str = "</code></pre>";
+    const MAX: usize = MAX_HIGHLIGHT_CHARS;
+
+    let ss = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+    let ts = THEMES.get_or_init(ThemeSet::load_defaults);
+    let theme = &ts.themes["base16-ocean.light"];
+
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let Some(i) = rest.find(OPEN) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..i]);
+        let after = &rest[i + OPEN.len()..];
+        // 取出语言 token（到下一个双引号为止）
+        let Some(q) = after.find('"') else {
+            out.push_str(&rest[i..]);
+            break;
+        };
+        let token = &after[..q];
+        let tail = &after[q + 1..];
+        // 跳过 <code class="language-XXX"> 末尾的 '>'，进入真正的代码内容
+        let tail = tail.strip_prefix('>').unwrap_or(tail);
+        let Some(j) = tail.find(CLOSE) else {
+            out.push_str(&rest[i..]);
+            break;
+        };
+        let content_escaped = &tail[..j];
+        // pulldown 已对内容做 HTML 转义，先还原再交给 syntect（syntect 会自行转义）
+        let raw = unescape_html(content_escaped);
+        let syntax = find_syntax_by_token(ss, token);
+        let inner = if raw.len() > MAX {
+            escape_html(&raw)
+        } else {
+            match highlighted_html_for_string(&raw, ss, syntax, theme) {
+                Ok(h) => strip_syntect_pre(&h),
+                Err(_) => escape_html(&raw),
+            }
+        };
+        out.push_str("<pre class=\"md-code\"><code>");
+        out.push_str(&inner);
+        out.push_str("</code></pre>");
+        rest = &tail[j + CLOSE.len()..];
+    }
+    out
+}
+
+/// 把 pulldown-cmark 生成的数学 <span> 转换为 MathJax 的分隔符形式。
+fn wrap_math_spans(html: &str) -> String {
+    const IN_OPEN: &str = "<span class=\"math math-inline\">";
+    const DISP_OPEN: &str = "<span class=\"math math-display\">";
+    const CLOSE: &str = "</span>";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        // 取「最早出现」的两种数学开标签（不能只用 if/else，否则会跳过它之前的另一种）
+        let ii = rest.find(IN_OPEN);
+        let di = rest.find(DISP_OPEN);
+        let pick = match (ii, di) {
+            (Some(i), Some(d)) => Some(if i <= d { (i, true) } else { (d, false) }),
+            (Some(i), None) => Some((i, true)),
+            (None, Some(d)) => Some((d, false)),
+            (None, None) => None,
+        };
+        match pick {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some((i, is_inline)) => {
+                out.push_str(&rest[..i]);
+                let open_len = if is_inline { IN_OPEN.len() } else { DISP_OPEN.len() };
+                let after = &rest[i + open_len..];
+                if let Some(j) = after.find(CLOSE) {
+                    out.push_str(if is_inline { "\\(" } else { "\\[" });
+                    out.push_str(&after[..j]);
+                    out.push_str(if is_inline { "\\)" } else { "\\]" });
+                    rest = &after[j + CLOSE.len()..];
+                } else {
+                    out.push_str(&rest[i..]);
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 对路径逐段做 URL 编码（保留 / 分隔符）
@@ -2092,9 +2276,44 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// 还原 pulldown 在代码块里做过的 HTML 实体转义，交回 syntect 重新着色
+fn unescape_html(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}
+
 /// 仅转义 & < >（保留引号），用于搜索片段：先转义再插入 <mark> 高亮标签
 fn esc_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// 按 Markdown 代码块的语言标记（如 python / c / sh / rust）选择语法
+fn find_syntax_by_token<'a>(ss: &'a SyntaxSet, token: &str) -> &'a SyntaxReference {
+    let t = token.trim().to_ascii_lowercase();
+    ss.find_syntax_by_token(&t)
+        .or_else(|| ss.find_syntax_by_extension(&t))
+        .or_else(|| ss.find_syntax_by_name(token))
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
+}
+
+/// 去掉 syntect 输出最外层的 <pre ...></pre>，仅保留内部彩色 span 片段
+fn strip_syntect_pre(html: &str) -> String {
+    let mut h = html.to_string();
+    // 去掉开头 <pre ...>（可能有前导空白/换行）
+    if let Some(start) = h.find("<pre") {
+        if let Some(end) = h[start..].find('>') {
+            h = h[start + end + 1..].to_string();
+        }
+    }
+    // 去掉结尾 </pre>
+    if let Some(end) = h.rfind("</pre>") {
+        h.truncate(end);
+    }
+    h
 }
 
 /// 按扩展名 / 文件名选择语法

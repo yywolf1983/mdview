@@ -5,7 +5,7 @@
 ## 功能特性
 
 - 📂 **多目录浏览** — 通过配置文件托管多个目录，并在它们之间一键切换
-- 📄 **Markdown 渲染** — 将 Markdown 渲染为美观的 GitHub 风格页面，支持表格、删除线、任务列表、标题属性
+- 📄 **Markdown 渲染** — 将 Markdown 渲染为美观的 GitHub 风格页面，支持表格、删除线、任务列表、标题属性、数学公式（MathJax）
 - 🖼 **图片查看** — 在线预览 png / jpg / gif / svg / webp / bmp / avif 等图片，并显示尺寸与大小
 - 💻 **代码查看** — 语法高亮查看 C、C++、Java、Python、Rust、JS、TS、CSS、HTML、Go、Kotlin 等主流语言（带行号）
 - 📝 **文本查看** — txt / log / ini / json / yaml 等配置文件与日志
@@ -94,7 +94,7 @@ mdview --config ~/mdview.toml
 |------|------|
 | [axum](https://crates.io/crates/axum) | 异步 Web 框架，负责路由与 HTTP 服务 |
 | [tokio](https://crates.io/crates/tokio) | Rust 异步运行时 |
-| [pulldown-cmark](https://crates.io/crates/pulldown-cmark) | Markdown → HTML 解析器（启用表格 / 删除线 / 任务列表 / 标题属性扩展） |
+| [pulldown-cmark](https://crates.io/crates/pulldown-cmark) | Markdown → HTML 解析器（启用表格 / 删除线 / 任务列表 / 标题属性 / 数学公式扩展） |
 | [syntect](https://crates.io/crates/syntect) | 服务端代码语法高亮（Sublime Text 语法集，离线可用） |
 | [clap](https://crates.io/crates/clap) | 命令行参数解析 |
 | [urlencoding](https://crates.io/crates/urlencoding) | URL 路径解码 |
@@ -107,9 +107,10 @@ mdview --config ~/mdview.toml
 mdview/
 ├── Cargo.toml           # 项目配置与依赖
 ├── Containerfile        # 运行镜像：多阶段构建 Rust 二进制
-├── cross.Dockerfile     # （已弃用）旧交叉编译镜像，见 README「交叉编译」说明
 ├── compose.yml          # podman-compose：本地/服务器运行服务
-├── cross-compose.yml    # （已弃用）旧容器内编译编排，见 README「交叉编译」说明
+├── cross.Dockerfile     # 交叉编译镜像：在 arm64 容器内装配 musl-gcc / zig / mingw
+├── cross-compose.yml    # 交叉编译编排：podman-compose 启动编译容器，挂载 ./dist 为产物目录
+├── cross-build.sh       # 交叉编译脚本：解析 TARGETS，产出 Linux arm64 / amd64 / Windows 二进制
 ├── mdview.toml          # 运行配置：多目录 + 密码（首次自动生成示例）
 ├── .dockerignore        # 构建上下文忽略（target/dist 等）
 ├── src/
@@ -120,7 +121,7 @@ mdview/
 │       └── app.js            # 回到顶部 / 锚点模糊匹配 / 删除确认弹窗
 ├── docs/
 │   └── hello.md         # 示例文档
-├── dist/                # （旧方案产物目录）改用 cargo-zigbuild 后产物在 target/<triple>/release/
+├── dist/                # 交叉编译产物目录（容器内 /out 挂载到此）
 └── README.md
 ```
 
@@ -143,45 +144,51 @@ path = "/data/notes"
 
 ### 2. 容器运行（podman-compose）
 
-`compose.yml` 用多阶段 `Containerfile` 构建镜像并运行，挂载配置与待浏览目录：
+`compose.yml` 用多阶段 `Containerfile` 构建运行镜像并启动服务，待浏览目录通过 `volumes` 挂进容器（把 `/Users/yy/...` 换成你自己的目录）：
 
 ```bash
 # 构建并后台启动
-podman build -f cross.Dockerfile -t mdview-cross
-
-podman-compose -f cross-compose.yml run --rm \    
-  -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
+podman-compose -f compose.yml up -d --build
 
 # 查看 / 停止
-podman build -f Containerfile -t mdview
-
 podman-compose -f compose.yml ps
 podman-compose -f compose.yml down
-
-重新编译后要重启才能生效
 ```
 
-访问 `http://127.0.0.1:9880`。注意：容器内 `mdview.toml` 使用容器路径（`/data/...`），待浏览目录必须通过 `compose.yml` 的 `volumes` 挂进容器（参考示例把 `/Users/yy/notes` 改成你自己的目录）。
+访问 `http://127.0.0.1:9880`。注意：容器内 `mdview.toml` 使用容器路径（`/data/...`），待浏览目录必须通过 `compose.yml` 的 `volumes` 挂进容器（参考示例把 `/Users/yy/notes` 改成你自己的目录）。重新编译构建后需 `down` 再 `up --build` 才能生效。
 
-### 3. 交叉编译 Linux 静态二进制（cargo-zigbuild，本机直接编）
+### 3. 交叉编译（多平台静态二进制，podman-compose）
 
-无需 Docker / 虚拟机，在 macOS（含 Apple Silicon）或 Linux 本机直接用 [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) 交叉编译 **musl 静态二进制**。它借助 [Zig](https://ziglang.org) 作为交叉链接器，支持一条命令产出 x86_64 / aarch64 的 Linux 静态可执行文件。
-
-#### 安装工具链
+跨平台静态二进制（Linux arm64 / amd64 的 musl 静态可执行文件 + Windows x64 exe）通过 `cross-compose.yml` + `cross-build.sh` 在 arm64 容器内编译，**无需本机安装交叉工具链**。容器基于 `rust:1.97-bookworm-linuxarm64`，已预装 `musl-tools`、`mingw-w64`、`zig` 与 `cargo-zigbuild`，并内置目标 `aarch64-unknown-linux-musl`、`x86_64-unknown-linux-musl`、`x86_64-pc-windows-gnu`。
 
 ```bash
-# 1) 安装 Zig 编译器
-brew install zig
+# 默认单目标（aarch64-unknown-linux-musl）
+podman-compose -f cross-compose.yml run --rm build
 
-# 2) 安装 cargo-zigbuild（Rust 子命令）
+# 多目标（用 TARGETS 环境变量覆盖，空格分隔）
+podman-compose -f cross-compose.yml run --rm \
+  -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
+  build
+```
+
+产物输出到宿主 `./dist`（`cross-compose.yml` 把容器内 `/out` 挂载到这里）：
+
+| 目标 | 编译方式 | 产物文件 |
+|------|----------|----------|
+| `aarch64-unknown-linux-musl` | 原生 `musl-gcc` | `dist/mdview-linux-arm64` |
+| `x86_64-unknown-linux-musl` | `cargo-zigbuild`（zig 作链接器） | `dist/mdview-linux-amd64` |
+| `x86_64-pc-windows-gnu` | `mingw-w64` 链接 | `dist/mdview-windows-amd64.exe` |
+
+> 说明：三个目标分别是「arm64 原生 musl-gcc」「x86_64 走 zigbuild」「Windows 用 mingw」。均为静态链接，可直接在对应平台运行，无需额外运行时。
+
+#### （可选）本机直接编（cargo-zigbuild，免容器）
+
+若不想用容器，也可在 macOS（含 Apple Silicon）/ Linux 本机用 [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) + [Zig](https://ziglang.org) 直接交叉编译 Linux musl 静态二进制（仅覆盖 Linux 两个 musl 目标，不含 Windows）：
+
+```bash
+brew install zig              # 或 pip install cargo-zigbuild（自带 zig）
 cargo install cargo-zigbuild
-# 或者用 pip 安装（会自动拉取 ziglang，可省略上面的 brew 步骤）
-# pip install cargo-zigbuild
-```
 
-#### 编译
-
-```bash
 # 编 x86_64 静态二进制 -> target/x86_64-unknown-linux-musl/release/mdview
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
@@ -191,19 +198,11 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 # 一次编多个目标
 cargo zigbuild --release \
   --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-```
 
-产物为 musl 静态链接，可在任意对应架构的 Linux 发行版直接运行（无需 glibc）：
-
-```bash
 file target/x86_64-unknown-linux-musl/release/mdview   # 应显示 "statically linked"
 ```
 
 > 本项目依赖均为纯 Rust（axum / tokio / syntect 等），musl 下直接静态链接成功，无需额外 C 交叉编译器。
-
-#### （旧方案，已弃用）podman-compose + musl 镜像
-
-早期版本用 `cross-compose.yml` + `cross.Dockerfile` 在 Linux 容器内编译，现已不再推荐（需 Docker 镜像且国内拉取受限）。相关文件保留仅供参考，建议改用上面的 cargo-zigbuild 方案。
 
 ## 安全设计
 

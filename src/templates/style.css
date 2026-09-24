@@ -311,6 +311,11 @@ pre code {
   font-size: inherit;
   font-family: inherit;
 }
+/* Markdown 内 ```lang 代码块：用 syntect 上色，背景对齐其浅色主题 */
+.md-code {
+  background: #eff1f5;
+  color: #2e3440;
+}
 
 /* ---- Blockquote ---- */
 blockquote {

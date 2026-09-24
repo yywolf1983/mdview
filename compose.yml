@@ -16,6 +16,7 @@ services:
       - /Users/yy/aaa/yy/notes:/data/notes:rw           # 换成你自己的笔记目录
       - /Users/yy/aaa/yy:/data/yy:rw           # 换成你自己的笔记目录
       - /Users/yy/aaa/blog:/data/blog:rw           # 换成你自己的笔记目录
+      - /Users/yy/github/maths-cs-ai-compendium/zh:/data/maths-cs-ai:rw           # 换成你自己的笔记目录
     userns_mode: "keep-id"
     security_opt:
       - label=disable
