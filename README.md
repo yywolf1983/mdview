@@ -162,10 +162,10 @@ podman-compose -f compose.yml down
 跨平台静态二进制（Linux arm64 / amd64 的 musl 静态可执行文件 + Windows x64 exe）通过 `cross-compose.yml` + `cross-build.sh` 在 arm64 容器内编译，**无需本机安装交叉工具链**。容器基于 `rust:1.97-bookworm-linuxarm64`，已预装 `musl-tools`、`mingw-w64`、`zig` 与 `cargo-zigbuild`，并内置目标 `aarch64-unknown-linux-musl`、`x86_64-unknown-linux-musl`、`x86_64-pc-windows-gnu`。
 
 ```bash
-# 默认单目标（aarch64-unknown-linux-musl）
+# 默认全平台构建（aarch64 / x86_64 Linux musl + x86_64 Windows）
 podman-compose -f cross-compose.yml run --rm build
 
-# 多目标（用 TARGETS 环境变量覆盖，空格分隔）
+# 指定目标（用 TARGETS 环境变量覆盖，空格分隔；也可 -e TARGET=单目标）
 podman-compose -f cross-compose.yml run --rm \
   -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
   build

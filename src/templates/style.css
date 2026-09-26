@@ -608,6 +608,34 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   transition: all .15s ease;
 }
 .raw:hover { background: var(--accent-soft); color: var(--accent); border-color: #ddd6fe; }
+/* 文件列表顶部的排序切换条 */
+.file-list-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.file-list-bar-title { font-weight: 700; color: #111827; font-size: .98em; }
+.sort-switch {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: .82em; color: var(--muted);
+}
+.sort-switch-label { margin-right: 4px; }
+.sort-opt {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  color: var(--muted);
+  text-decoration: none;
+  transition: all .15s ease;
+  cursor: pointer;
+}
+.sort-opt:hover { color: var(--accent); border-color: #ddd6fe; background: var(--accent-soft); }
+.sort-opt.active {
+  color: #fff; background: var(--accent); border-color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 2px 6px rgba(139,92,246,.35);
+}
 .empty-state {
   text-align: center; padding: 50px 20px; color: var(--muted);
 }
@@ -713,6 +741,13 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   border-color: #8b5cf6;
   box-shadow: 0 0 0 4px rgba(139,92,246,.12), var(--shadow-lg);
 }
+/* 编辑态：长行自动软折行（与透明 textarea 同步折行，保持光标/高亮对齐）；
+   代码查看态仍保持 pre 不折行，便于阅读源码 */
+.editor-highlight .cl {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;   /* 超长无空格串（长 URL 等）也强制断开，避免横向溢出 */
+  tab-size: 4;               /* 与 textarea 的 tab-size 一致，保证制表符对齐 */
+}
 /* 每行（编辑态 .cl / 查看态由 JS 同样包 .cl），相对定位以便行号伪元素定位 */
 .editor-highlight .cl,
 .code-body .cl {
@@ -722,11 +757,14 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   font-family: inherit;
   font-variant-ligatures: none;
   letter-spacing: normal;
-  white-space: pre;
   padding-left: calc(var(--ln-w) + var(--ln-pad));
   min-height: calc(1em * var(--code-line));
   line-height: var(--code-line);
   counter-increment: codeline;
+}
+/* 代码查看态：不软换行（源码阅读习惯） */
+.code-body .cl {
+  white-space: pre;
 }
 /* 行号：绘制在每行左侧固定区域，灰色、不可选中 */
 .editor-highlight .cl::before,
@@ -820,7 +858,8 @@ ul.file-list li a.primary-link:hover .file-name { color: var(--link); }
   outline: none;
   box-shadow: none;
   -webkit-text-fill-color: transparent;
-  white-space: pre;             /* 不软换行，与高亮层逐行对齐 */
+  white-space: pre-wrap;        /* 编辑态长行自动软折行，与高亮层逐行对齐 */
+  overflow-wrap: anywhere;       /* 与高亮层一致：超长无空格串也强制断开 */
   overflow: hidden;
   tab-size: 4;
 }

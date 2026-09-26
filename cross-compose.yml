@@ -8,7 +8,9 @@
 #  4. platform: linux/arm64 保证 M 芯片原生运行
 #
 #  用法：
+#    # 默认全平台构建（aarch64 / x86_64 Linux musl + x86_64 Windows）
 #    podman-compose -f cross-compose.yml run --rm build
+#    # 指定目标（覆盖默认）
 #    podman-compose -f cross-compose.yml run --rm \
 #      -e TARGETS="aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu" \
 #      build
@@ -26,10 +28,8 @@ services:
       - ./dist:/out:z
       - cargo-registry:/usr/local/cargo/registry
     environment:
-      # 默认单目标
-      TARGET: "aarch64-unknown-linux-musl"
-      # 多目标（关键：允许 podman-compose run -e 覆盖）
-      TARGETS: "${TARGETS:-}"
+      # 默认全平台构建（允许 podman-compose run -e TARGETS=... 覆盖）
+      TARGETS: "${TARGETS:-aarch64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-pc-windows-gnu}"
 
       # aarch64 原生（musl-gcc）
       CC_aarch64_unknown_linux_musl: "musl-gcc"

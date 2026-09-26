@@ -99,6 +99,69 @@ struct FileItem {
     mtime: Option<std::time::SystemTime>, // 用于"最新修改在前"排序（不传到前端）
 }
 
+/// 文件列表排序方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    /// 修改时间倒序（新→旧），默认
+    Mtime,
+    /// 名称（不区分大小写）
+    Name,
+}
+impl SortBy {
+    /// 从查询参数解析；无法识别时返回 None，由调用方回退到默认（Mtime）
+    fn from_param(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "name" | "n" => Some(SortBy::Name),
+            "mtime" | "time" | "date" | "modified" | "m" => Some(SortBy::Mtime),
+            _ => None,
+        }
+    }
+    fn as_param(self) -> &'static str {
+        match self {
+            SortBy::Mtime => "mtime",
+            SortBy::Name => "name",
+        }
+    }
+}
+impl Default for SortBy {
+    fn default() -> Self {
+        SortBy::Mtime
+    }
+}
+
+/// 列表排序查询参数（?sort=mtime|name），缺省回退到默认值
+#[derive(Deserialize, Debug, Default)]
+struct SortQuery {
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+/// 在「目录优先」已比较完毕后，按指定方式排序两个同级条目
+fn sort_files_tie(a: &FileItem, b: &FileItem, sort: SortBy) -> std::cmp::Ordering {
+    match sort {
+        SortBy::Mtime => {
+            // 修改时间倒序（新→旧），缺失时间排最后；同时间再按名称兜底
+            match (a.mtime, b.mtime) {
+                (Some(ta), Some(tb)) => tb.cmp(&ta),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }
+        SortBy::Name => {
+            // 名称（不区分大小写）升序，名称相同再按修改时间倒序兜底
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| match (a.mtime, b.mtime) {
+                    (Some(ta), Some(tb)) => tb.cmp(&ta),
+                    _ => std::cmp::Ordering::Equal,
+                })
+        }
+    }
+}
+
 /// 新建文件 / 目录的表单
 #[derive(Deserialize, Debug)]
 struct NewForm {
@@ -368,14 +431,16 @@ fn open_browser(url: &str) {
 async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<SortQuery>,
 ) -> Result<Html<String>, Redirect> {
     if state.need_auth() && !cookie_auth_valid(&headers, &state) {
         return Err(Redirect::to("/login"));
     }
     let root = active_root(&headers, &state);
-    let files = list_files(&root, &root).unwrap_or_default();
+    let sort = q.sort.as_deref().and_then(SortBy::from_param).unwrap_or_default();
+    let files = list_files(&root, &root, sort).unwrap_or_default();
     let switcher = dir_switcher_html(&state, &headers);
-    let body = file_list_html(&files, true, "");
+    let body = file_list_html(&files, true, "", sort);
     let html = render_page("Markdown 浏览器", "", &switcher, &body);
     Ok(Html(html))
 }
@@ -385,6 +450,7 @@ async fn browse(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(subpath): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<SortQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let root = active_root(&headers, &state);
     if state.need_auth() && !cookie_auth_valid(&headers, &state) {
@@ -393,11 +459,12 @@ async fn browse(
     let target = resolve_path(&root, &subpath);
 
     if target.is_dir() {
-        let files = list_files(&root, &target).unwrap_or_default();
+        let sort = q.sort.as_deref().and_then(SortBy::from_param).unwrap_or_default();
+        let files = list_files(&root, &target, sort).unwrap_or_default();
         let rel_dir = display_rel(&root, &target);
         let title = format!("目录 /{}", rel_dir);
         let switcher = dir_switcher_html(&state, &headers);
-        let body = file_list_html(&files, false, &rel_dir);
+        let body = file_list_html(&files, false, &rel_dir, sort);
         let html = render_page(
             &title,
             &breadcrumb(&root, &target),
@@ -1412,7 +1479,7 @@ fn resolve_path(root: &FsPath, subpath: &str) -> PathBuf {
 }
 
 /// 列出目录下的文件（递归，只保留 .md 或子目录）
-fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
+fn list_files(root: &FsPath, dir: &FsPath, sort: SortBy) -> anyhow::Result<Vec<FileItem>> {
     let mut items = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -1439,23 +1506,15 @@ fn list_files(root: &FsPath, dir: &FsPath) -> anyhow::Result<Vec<FileItem>> {
         }
     }
     items.sort_by(|a, b| {
+        // 目录永远排在文件之前；同级再按所选方式排序
         b.is_dir
-            .cmp(&a.is_dir) // 目录永远在前
-            .then_with(|| {
-                // 目录内部 / 文件内部：最新修改时间排在最前
-                match (a.mtime, b.mtime) {
-                    (Some(ta), Some(tb)) => tb.cmp(&ta), // 倒序（新→旧）
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            })
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())) // 同时间兜底按名称
+            .cmp(&a.is_dir)
+            .then_with(|| sort_files_tie(a, b, sort))
     });
     Ok(items)
 }
 
-fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
+fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str, sort: SortBy) -> String {
     let _ = rel_dir;
     if files.is_empty() {
         return r#"<div class="card empty-state">
@@ -1465,10 +1524,33 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str) -> String {
 </div>"#
             .to_string();
     }
+    // 排序切换条：默认「修改时间」，可切到「名称」。相对链接 ?sort=xxx 同时适用于
+    // 首页（/）与子目录浏览（/browse/...），自动保留当前路径。
+    let (m_cls, n_cls) = match sort {
+        SortBy::Mtime => (" active", ""),
+        SortBy::Name => ("", " active"),
+    };
+    let bar = format!(
+        r#"<div class="file-list-bar">
+  <span class="file-list-bar-title">文件</span>
+  <span class="sort-switch" role="group" aria-label="排序方式">
+    <span class="sort-switch-label">排序</span>
+    <a class="sort-opt{m}" href="?sort={mtime}">修改时间</a>
+    <a class="sort-opt{n}" href="?sort={name}">名称</a>
+  </span>
+</div>"#,
+        m = m_cls,
+        n = n_cls,
+        mtime = SortBy::Mtime.as_param(),
+        name = SortBy::Name.as_param(),
+    );
     let mut html = String::new();
-    html.push_str("<div class=\"card\"><ul class='file-list'>");
+    html.push_str("<div class=\"card\">");
+    html.push_str(&bar);
+    html.push_str("<ul class='file-list'>");
     for f in files {
-        let href = format!("/browse/{}", url_encode_path(&f.path));
+        // 主链接（目录列表 / md 查看）携带 ?sort=，使「进入子目录」时保持当前排序方式
+        let href = format!("/browse/{}?sort={}", url_encode_path(&f.path), sort.as_param());
         let icon = match f.kind.as_str() {
             "dir" => "📁",
             "md" => "📄",
