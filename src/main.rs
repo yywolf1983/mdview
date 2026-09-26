@@ -95,37 +95,58 @@ struct FileItem {
     is_dir: bool,
     /// dir / md / img / code / txt / bin，用于列表图标与操作区分
     kind: String,
+    size: u64, // 字节数，用于"大小"排序
     #[serde(skip)]
-    mtime: Option<std::time::SystemTime>, // 用于"最新修改在前"排序（不传到前端）
+    mtime: Option<std::time::SystemTime>, // 用于"修改时间"排序（不传到前端）
 }
 
-/// 文件列表排序方式
+/// 文件列表排序方式（目录始终排在文件之前，以下仅决定同级排序）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortBy {
     /// 修改时间倒序（新→旧），默认
-    Mtime,
-    /// 名称（不区分大小写）
-    Name,
+    MtimeDesc,
+    /// 修改时间升序（旧→新）
+    MtimeAsc,
+    /// 名称升序（A→Z，不区分大小写）
+    NameAsc,
+    /// 名称降序（Z→A）
+    NameDesc,
+    /// 大小降序（大→小）
+    SizeDesc,
+    /// 大小升序（小→大）
+    SizeAsc,
+    /// 按类型分组（md / img / code / txt / bin），同类型内按名称
+    Kind,
 }
 impl SortBy {
-    /// 从查询参数解析；无法识别时返回 None，由调用方回退到默认（Mtime）
+    /// 从查询参数解析；无法识别时返回 None，由调用方回退到默认（MtimeDesc）
     fn from_param(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "name" | "n" => Some(SortBy::Name),
-            "mtime" | "time" | "date" | "modified" | "m" => Some(SortBy::Mtime),
+            "mtime" | "m" | "modified" | "time" | "date" => Some(SortBy::MtimeDesc),
+            "mtime_asc" | "old" => Some(SortBy::MtimeAsc),
+            "name" | "n" | "az" => Some(SortBy::NameAsc),
+            "name_desc" | "za" => Some(SortBy::NameDesc),
+            "size" | "s" | "big" => Some(SortBy::SizeDesc),
+            "size_asc" | "small" => Some(SortBy::SizeAsc),
+            "kind" | "type" | "k" => Some(SortBy::Kind),
             _ => None,
         }
     }
     fn as_param(self) -> &'static str {
         match self {
-            SortBy::Mtime => "mtime",
-            SortBy::Name => "name",
+            SortBy::MtimeDesc => "mtime",
+            SortBy::MtimeAsc => "mtime_asc",
+            SortBy::NameAsc => "name",
+            SortBy::NameDesc => "name_desc",
+            SortBy::SizeDesc => "size",
+            SortBy::SizeAsc => "size_asc",
+            SortBy::Kind => "kind",
         }
     }
 }
 impl Default for SortBy {
     fn default() -> Self {
-        SortBy::Mtime
+        SortBy::MtimeDesc
     }
 }
 
@@ -139,26 +160,57 @@ struct SortQuery {
 /// 在「目录优先」已比较完毕后，按指定方式排序两个同级条目
 fn sort_files_tie(a: &FileItem, b: &FileItem, sort: SortBy) -> std::cmp::Ordering {
     match sort {
-        SortBy::Mtime => {
-            // 修改时间倒序（新→旧），缺失时间排最后；同时间再按名称兜底
-            match (a.mtime, b.mtime) {
-                (Some(ta), Some(tb)) => tb.cmp(&ta),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
+        SortBy::MtimeDesc => mtime_cmp(a, b, false),
+        SortBy::MtimeAsc => mtime_cmp(a, b, true),
+        SortBy::NameAsc => name_cmp(a, b).then_with(|| mtime_cmp(a, b, false)),
+        SortBy::NameDesc => name_cmp(a, b).reverse().then_with(|| mtime_cmp(a, b, false)),
+        SortBy::SizeDesc => b
+            .size
+            .cmp(&a.size)
+            .then_with(|| name_cmp(a, b)),
+        SortBy::SizeAsc => a
+            .size
+            .cmp(&b.size)
+            .then_with(|| name_cmp(a, b)),
+        SortBy::Kind => kind_rank(&a.kind)
+            .cmp(&kind_rank(&b.kind))
+            .then_with(|| name_cmp(a, b)),
+    }
+}
+
+/// 名称比较（不区分大小写）
+fn name_cmp(a: &FileItem, b: &FileItem) -> std::cmp::Ordering {
+    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+}
+
+/// 修改时间比较：无时间的条目始终排在有时间的之后；asc=true 为旧→新，false 为新→旧
+fn mtime_cmp(a: &FileItem, b: &FileItem, asc: bool) -> std::cmp::Ordering {
+    match (a.mtime.is_some(), b.mtime.is_some()) {
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+    match (a.mtime, b.mtime) {
+        (Some(x), Some(y)) => {
+            if asc {
+                x.cmp(&y)
+            } else {
+                y.cmp(&x)
             }
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         }
-        SortBy::Name => {
-            // 名称（不区分大小写）升序，名称相同再按修改时间倒序兜底
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| match (a.mtime, b.mtime) {
-                    (Some(ta), Some(tb)) => tb.cmp(&ta),
-                    _ => std::cmp::Ordering::Equal,
-                })
-        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// 类型分组权重（越小越靠前）
+fn kind_rank(k: &str) -> u8 {
+    match k {
+        "md" => 0,
+        "img" => 1,
+        "code" => 2,
+        "txt" => 3,
+        "bin" => 4,
+        _ => 5,
     }
 }
 
@@ -1401,31 +1453,43 @@ fn search_results_html(
 /// - 配置了多个目录：显示下拉框（前端直接写 Cookie 后刷新）
 /// - 仅 1 个目录：显示当前目录名 + 提示（方便排查“为什么不能切换”）
 fn dir_switcher_html(state: &AppState, headers: &HeaderMap) -> String {
+    // 转义用于 HTML 属性/文本的项目名，避免名称含引号/尖括号时破坏标签或 onclick（点击切换报错）
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
     if state.dirs.len() <= 1 {
         let name = state
             .dirs
             .first()
             .map(|d| d.name.as_str())
             .unwrap_or("（无）");
+        let n = esc(name);
         return format!(
-            r#"<div class="dir-switch dir-switch-single">
+            r#"<div class="dir-switch dir-switch-single" data-dir-key="{n}">
   <label>📁</label>
-  <span class="dir-single-name">{name}</span>
+  <span class="dir-single-name">{n}</span>
   <span class="dir-single-hint">（仅配置 1 个目录，无法切换）</span>
 </div>"#
         );
     }
     let cur = selected_index(headers, state);
+    let cur_name = state.dirs.get(cur).map(|d| d.name.as_str()).unwrap_or("");
+    let cur_n = esc(cur_name);
     let mut btns = String::new();
     for (i, d) in state.dirs.iter().enumerate() {
         let active = if i == cur { " active" } else { "" };
+        let dn = esc(&d.name);
+        // 切换项目时跳到根目录、不沿用上一个项目的 ?sort，由各自项目的记忆排序决定
         btns.push_str(&format!(
-            "<button type=\"button\" class=\"dir-tab{}\" data-idx=\"{}\" onclick=\"document.cookie='mdview_dir={}; Path=/; Max-Age=86400; SameSite=Lax'; location.href='/';\">{}</button>",
-            active, i, i, d.name
+            "<button type=\"button\" class=\"dir-tab{}\" data-idx=\"{}\" data-key=\"{}\" onclick=\"document.cookie='mdview_dir={}; Path=/; Max-Age=86400; SameSite=Lax'; location.href='/';\" title=\"{}\">{}</button>",
+            active, i, dn, i, dn, dn
         ));
     }
     format!(
-        r#"<div class="dir-switch">
+        r#"<div class="dir-switch" data-dir-key="{cur_n}">
   <span class="dir-switch-label">📁</span>
   <div class="dir-tabs">{btns}</div>
 </div>"#
@@ -1496,11 +1560,13 @@ fn list_files(root: &FsPath, dir: &FsPath, sort: SortBy) -> anyhow::Result<Vec<F
             let rel = path.strip_prefix(root).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             let mtime = entry.metadata().ok().and_then(|md| md.modified().ok());
+            let size = entry.metadata().ok().map(|md| md.len()).unwrap_or(0);
             items.push(FileItem {
                 name,
                 path: rel_str,
                 is_dir,
                 kind: kind.to_string(),
+                size,
                 mtime,
             });
         }
@@ -1524,25 +1590,39 @@ fn file_list_html(files: &[FileItem], _is_root: bool, rel_dir: &str, sort: SortB
 </div>"#
             .to_string();
     }
-    // 排序切换条：默认「修改时间」，可切到「名称」。相对链接 ?sort=xxx 同时适用于
-    // 首页（/）与子目录浏览（/browse/...），自动保留当前路径。
-    let (m_cls, n_cls) = match sort {
-        SortBy::Mtime => (" active", ""),
-        SortBy::Name => ("", " active"),
-    };
+    // 排序下拉框：覆盖多种排序方式，默认「修改时间（新→旧）」。
+    // 使用 GET 表单 + onchange 自动提交，相对当前路径（首页 / 或 /browse/...）生效，
+    // 提交后 URL 变为 ?sort=xxx，与列表项链接的 ?sort= 保持一致。
+    let sort_options: &[(SortBy, &str)] = &[
+        (SortBy::MtimeDesc, "修改时间（新→旧）"),
+        (SortBy::MtimeAsc, "修改时间（旧→新）"),
+        (SortBy::NameAsc, "名称（A→Z）"),
+        (SortBy::NameDesc, "名称（Z→A）"),
+        (SortBy::SizeDesc, "大小（大→小）"),
+        (SortBy::SizeAsc, "大小（小→大）"),
+        (SortBy::Kind, "类型"),
+    ];
+    let mut opts = String::new();
+    for (v, lbl) in sort_options {
+        let sel = if *v == sort { " selected" } else { "" };
+        opts.push_str(&format!(
+            "<option value=\"{}\"{}>{}</option>",
+            v.as_param(),
+            sel,
+            lbl
+        ));
+    }
     let bar = format!(
         r#"<div class="file-list-bar">
   <span class="file-list-bar-title">文件</span>
-  <span class="sort-switch" role="group" aria-label="排序方式">
-    <span class="sort-switch-label">排序</span>
-    <a class="sort-opt{m}" href="?sort={mtime}">修改时间</a>
-    <a class="sort-opt{n}" href="?sort={name}">名称</a>
-  </span>
+  <form class="sort-form" method="get" action="">
+    <label class="sort-label" for="sort-sel">排序</label>
+    <select id="sort-sel" name="sort" class="sort-select" onchange="this.form.submit()">
+      {opts}
+    </select>
+  </form>
 </div>"#,
-        m = m_cls,
-        n = n_cls,
-        mtime = SortBy::Mtime.as_param(),
-        name = SortBy::Name.as_param(),
+        opts = opts,
     );
     let mut html = String::new();
     html.push_str("<div class=\"card\">");

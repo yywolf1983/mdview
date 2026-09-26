@@ -588,3 +588,54 @@ document.addEventListener('keydown', function(e) {
     if (b.scrollTop !== before) e.preventDefault();
   }, { passive: false });
 })();
+
+/* ---------- 排序：按项目独立记忆 ---------- */
+(function(){
+  // 当前项目键：取目录切换器上的 data-dir-key（项目名），未取到则用 default
+  function projectKey() {
+    var el = document.querySelector('.dir-switch');
+    var k = el && el.getAttribute('data-dir-key');
+    return 'mdview_sort__' + (k || 'default');
+  }
+  function urlSort() {
+    return new URLSearchParams(window.location.search).get('sort') || '';
+  }
+  // 加载时把当前 URL 的排序写回“当前项目”的 localStorage
+  function syncFromUrl() {
+    var s = urlSort();
+    if (s) { try { localStorage.setItem(projectKey(), s); } catch (_) {} }
+  }
+  // URL 没有 ?sort= 时，应用“当前项目”记忆的排序（一次性重定向，仅列表页）
+  function applySavedIfMissing() {
+    if (!document.getElementById('sort-sel')) return;
+    var p = new URLSearchParams(window.location.search);
+    if (p.has('sort')) return;
+    var saved = null;
+    try { saved = localStorage.getItem(projectKey()); } catch (_) {}
+    if (saved) {
+      p.set('sort', saved);
+      var qs = p.toString();
+      window.location.replace(window.location.pathname + (qs ? ('?' + qs) : ''));
+    }
+  }
+  function init() {
+    syncFromUrl();
+    var sel = document.getElementById('sort-sel');
+    if (sel) {
+      sel.addEventListener('change', function() {
+        try { localStorage.setItem(projectKey(), this.value); } catch (_) {}
+      });
+    }
+  }
+  // 脚本位于 <head>，初次顶层执行时 <body> 尚未解析，#sort-sel 不存在会导致
+  // applySavedIfMissing 直接返回、记住的排序永远无法应用。因此统一延迟到 DOM 就绪后执行。
+  function boot() {
+    applySavedIfMissing();
+    init();
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
